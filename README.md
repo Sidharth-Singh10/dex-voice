@@ -4,16 +4,16 @@
 
 Dex Voice is an experimental research prototype, not a product. It captures a physical
 microphone, recognizes speech locally with Parakeet, synthesizes the recognized text with
-a Phonon voice on the CPU, and publishes the result as a PipeWire virtual microphone that
-Discord, Meet, or another calling application can select. Audio does not leave the machine,
-and there is no account, telemetry, or hosted service.
+a Phonon voice on the CPU, and publishes the result as a PipeWire virtual microphone.
+Applications that accept normal PipeWire/PulseAudio capture sources are expected to see
+the virtual device; check the application's microphone permissions and device list if it
+does not appear. Audio does not leave the machine, and there is no account, telemetry, or
+hosted service.
 
 The signal path works end to end on Linux, but the result is **not** a real-time
 conversational voice changer. Speech is handled phrase by phrase after a pause, the bridge
 is half-duplex, and output can fall behind long or overlapping speech. Read the
 [limitations](#limitations) before trying it.
-
-![Dex Voice desktop application, idle](docs/screenshots/desktop-idle.png)
 
 ## What it does
 
@@ -54,26 +54,33 @@ Phonon English checkpoint, CPU
   remapped source: DexMicrophone
         |
         v
-Discord / Meet / another application
+application using a PipeWire/PulseAudio capture source
 ```
 
-Everything in that path is local. The virtual microphone is a deliberate remap: Discord and
-some browsers hide plain `.monitor` sources, while a remapped source is listed like any
-other capture device.
+Everything in that path is local. The virtual microphone is a deliberate remap: some
+applications hide plain `.monitor` sources, while a remapped source is presented as a
+normal capture device.
 
 ## Screenshots
 
-The redesigned Rune interface, shown in its main states:
+Above-the-fold state crops from the Rune interface. These show the status card only; the
+live diagnostics panel is intentionally omitted.
 
-| Idle | Listening |
-|---|---|
-| ![Idle](docs/screenshots/desktop-idle.png) | ![Listening](docs/screenshots/desktop-listening.png) |
-| **Speaking** | **Failed** |
-| ![Speaking](docs/screenshots/desktop-speaking.png) | ![Failed](docs/screenshots/desktop-failed.png) |
+![Idle state crop](docs/screenshots/desktop-idle.png)
 
-Settings, including explicit model paths and device pickers:
+*Idle: the bridge is stopped and ready to start.*
 
-![Settings](docs/screenshots/desktop-settings.png)
+![Speaking state crop](docs/screenshots/desktop-speaking.png)
+
+*Speaking: the microphone is muted while synthesized speech plays.*
+
+![Failed state crop](docs/screenshots/desktop-failed.png)
+
+*Failed: the bridge stopped with an actionable error.*
+
+Settings, showing explicit model paths, device pickers, and the installed voice:
+
+![Settings window](docs/screenshots/desktop-settings.png)
 
 The project website is a separate static showcase, not the application:
 
@@ -155,9 +162,10 @@ In the application:
    your speakers.
 4. Choose **Default**, **Zoey**, or **Juniper** as the Phonon voice.
 5. Save, press **Start**, and wait for **Listening** before speaking.
-6. In the receiving application, select **DexMicrophone** as the microphone. Restart an
-   application that was already running when the device was created, because most apps
-   enumerate devices only at startup.
+6. In the receiving application, select **DexMicrophone** as the microphone. Check the
+   application's microphone permissions and device list if it does not appear. If the
+   application was already open, reopen or reload its microphone list and reselect
+   DexMicrophone.
 
 The application never changes your system default speaker or microphone. To remove the
 virtual devices later, unload their PipeWire modules (see [`rust/LINUX.md`](rust/LINUX.md)).
