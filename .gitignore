@@ -1,0 +1,43 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Models and generated audio (never commit weights or recordings)
+models/
+runs/
+*.raw
+*.wav
+spike-results/*.wav
+
+# Rust
+rust/target/
+target/
+
+# Node / website
+node_modules/
+website/node_modules/
+.next/
+website/.next/
+website/out/
+website/coverage/
+website/playwright-report/
+website/test-results/
+website/blob-report/
+*.tsbuildinfo
+
+# Tooling and editor artifacts
+.playwright-mcp/
+.DS_Store
+*.log
+
+# Secrets and local environment
+.env
+.env.*
+*.pem
+*.key

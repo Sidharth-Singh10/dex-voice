@@ -1,0 +1,31 @@
+{
+  "id": "2086-149220-0033",
+  "audio": "../models/parakeet-240ms/test_wavs/0.wav",
+  "source": "LibriSpeech dev-clean, read speech; not representative of all conversational audio",
+  "alignment_source": "gilkeyio/librispeech-alignments, revision 0daa1eb43dda38ee6ce752e785555380e5628f5c, dev_clean row 49; Montreal Forced Aligner timings, not human-verified",
+  "words": [
+    {"word": "well", "start": 0.5, "end": 0.77},
+    {"word": "i", "start": 0.77, "end": 0.85},
+    {"word": "don't", "start": 0.85, "end": 1.09},
+    {"word": "wish", "start": 1.09, "end": 1.25},
+    {"word": "to", "start": 1.25, "end": 1.38},
+    {"word": "see", "start": 1.38, "end": 1.58},
+    {"word": "it", "start": 1.58, "end": 1.67},
+    {"word": "any", "start": 1.67, "end": 1.85},
+    {"word": "more", "start": 1.85, "end": 2.14},
+    {"word": "observed", "start": 2.17, "end": 2.58},
+    {"word": "phoebe", "start": 2.58, "end": 2.99},
+    {"word": "turning", "start": 3.32, "end": 3.65},
+    {"word": "away", "start": 3.65, "end": 3.89},
+    {"word": "her", "start": 3.89, "end": 4.09},
+    {"word": "eyes", "start": 4.09, "end": 4.44},
+    {"word": "it", "start": 5.03, "end": 5.17},
+    {"word": "is", "start": 5.17, "end": 5.28},
+    {"word": "certainly", "start": 5.28, "end": 5.76},
+    {"word": "very", "start": 5.76, "end": 6.03},
+    {"word": "like", "start": 6.03, "end": 6.28},
+    {"word": "the", "start": 6.28, "end": 6.39},
+    {"word": "old", "start": 6.39, "end": 6.58},
+    {"word": "portrait", "start": 6.58, "end": 7.14}
+  ]
+}

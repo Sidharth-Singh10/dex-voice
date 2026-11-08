@@ -1,0 +1,19 @@
+[package]
+name = "dex-voice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1"
+dex-audio = { path = "../../crates/dex-audio" }
+dex-core = { path = "../../crates/dex-core" }
+hound = "3.5"
+rune = { git = "https://github.com/anomalyco/rune", rev = "53c7f60f51ce12bd5da53145d9d86ce1552324e4" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "53c7f60f51ce12bd5da53145d9d86ce1552324e4" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

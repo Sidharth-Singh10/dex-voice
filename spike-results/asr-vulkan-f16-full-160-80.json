@@ -1,0 +1,231 @@
+{
+  "model": "../models/gguf/parakeet-unified-en-0.6b-F16.gguf",
+  "wav": "../models/parakeet-240ms/test_wavs/0.wav",
+  "backend": "vulkan",
+  "device": {
+    "name": "Vulkan1",
+    "description": "NVIDIA GeForce RTX 3050 4GB Laptop GPU",
+    "kind": "vulkan",
+    "device_type": "Gpu",
+    "memory_total_mib": 4096,
+    "memory_free_mib": 3100
+  },
+  "capabilities": {
+    "sample_rate": 16000,
+    "supports_streaming": true,
+    "max_audio_ms": 0,
+    "languages": [
+      "en"
+    ]
+  },
+  "reference_words": 23,
+  "gpu_peak_mib": 2269,
+  "offline": null,
+  "stream": {
+    "left_ms": 5600,
+    "chunk_ms": 160,
+    "right_ms": 80,
+    "commit_policy": "auto",
+    "commit_agreement": 0,
+    "source": "full",
+    "text": "Well, I don't wish to see it any more, observed Phoebe, turning away her eyes it is certainly very like the old portrait",
+    "audio_ms": 7435.0,
+    "wall_ms": 7495.050195,
+    "rtf": 0.9919880196346037,
+    "events": [
+      {
+        "index": 0,
+        "word": "Well,",
+        "wall_ms": 1382.74878,
+        "input_ms": 1360,
+        "ref_end_ms": 770.0,
+        "delay_ms": 612.7487799999999
+      },
+      {
+        "index": 1,
+        "word": "I",
+        "wall_ms": 1382.74878,
+        "input_ms": 1360,
+        "ref_end_ms": 850.0,
+        "delay_ms": 532.7487799999999
+      },
+      {
+        "index": 2,
+        "word": "don't",
+        "wall_ms": 1542.041352,
+        "input_ms": 1520,
+        "ref_end_ms": 1090.0,
+        "delay_ms": 452.04135199999996
+      },
+      {
+        "index": 3,
+        "word": "wish",
+        "wall_ms": 1698.3125449999998,
+        "input_ms": 1680,
+        "ref_end_ms": 1250.0,
+        "delay_ms": 448.3125449999998
+      },
+      {
+        "index": 4,
+        "word": "to",
+        "wall_ms": 1867.1987159999999,
+        "input_ms": 1840,
+        "ref_end_ms": 1380.0,
+        "delay_ms": 487.1987159999999
+      },
+      {
+        "index": 5,
+        "word": "see",
+        "wall_ms": 2023.112759,
+        "input_ms": 2000,
+        "ref_end_ms": 1580.0,
+        "delay_ms": 443.1127590000001
+      },
+      {
+        "index": 6,
+        "word": "it",
+        "wall_ms": 2180.1409559999997,
+        "input_ms": 2160,
+        "ref_end_ms": 1670.0,
+        "delay_ms": 510.14095599999973
+      },
+      {
+        "index": 7,
+        "word": "any",
+        "wall_ms": 2342.629,
+        "input_ms": 2320,
+        "ref_end_ms": 1850.0,
+        "delay_ms": 492.6289999999999
+      },
+      {
+        "index": 8,
+        "word": "more,",
+        "wall_ms": 2661.899842,
+        "input_ms": 2640,
+        "ref_end_ms": 2140.0,
+        "delay_ms": 521.8998419999998
+      },
+      {
+        "index": 9,
+        "word": "observed",
+        "wall_ms": 3163.547841,
+        "input_ms": 3120,
+        "ref_end_ms": 2580.0,
+        "delay_ms": 583.5478410000001
+      },
+      {
+        "index": 10,
+        "word": "Phoebe,",
+        "wall_ms": 3810.5924880000002,
+        "input_ms": 3760,
+        "ref_end_ms": 2990.0,
+        "delay_ms": 820.5924880000002
+      },
+      {
+        "index": 11,
+        "word": "turning",
+        "wall_ms": 4124.8411049999995,
+        "input_ms": 4080,
+        "ref_end_ms": 3650.0,
+        "delay_ms": 474.8411049999995
+      },
+      {
+        "index": 12,
+        "word": "away",
+        "wall_ms": 4447.798328,
+        "input_ms": 4400,
+        "ref_end_ms": 3890.0,
+        "delay_ms": 557.7983279999999
+      },
+      {
+        "index": 13,
+        "word": "her",
+        "wall_ms": 4610.322271,
+        "input_ms": 4560,
+        "ref_end_ms": 4090.0,
+        "delay_ms": 520.322271
+      },
+      {
+        "index": 14,
+        "word": "eyes",
+        "wall_ms": 5749.148045,
+        "input_ms": 5680,
+        "ref_end_ms": 4440.0,
+        "delay_ms": 1309.148045
+      },
+      {
+        "index": 15,
+        "word": "it",
+        "wall_ms": 5749.148045,
+        "input_ms": 5680,
+        "ref_end_ms": 5170.0,
+        "delay_ms": 579.1480449999999
+      },
+      {
+        "index": 16,
+        "word": "is",
+        "wall_ms": 5909.6047770000005,
+        "input_ms": 5840,
+        "ref_end_ms": 5280.0,
+        "delay_ms": 629.6047770000005
+      },
+      {
+        "index": 17,
+        "word": "certainly",
+        "wall_ms": 6377.164881,
+        "input_ms": 6320,
+        "ref_end_ms": 5760.0,
+        "delay_ms": 617.1648809999997
+      },
+      {
+        "index": 18,
+        "word": "very",
+        "wall_ms": 6538.393260999999,
+        "input_ms": 6480,
+        "ref_end_ms": 6030.0,
+        "delay_ms": 508.39326099999926
+      },
+      {
+        "index": 19,
+        "word": "like",
+        "wall_ms": 6690.313454,
+        "input_ms": 6640,
+        "ref_end_ms": 6280.0,
+        "delay_ms": 410.3134540000001
+      },
+      {
+        "index": 20,
+        "word": "the",
+        "wall_ms": 6848.65877,
+        "input_ms": 6800,
+        "ref_end_ms": 6390.0,
+        "delay_ms": 458.65877
+      },
+      {
+        "index": 21,
+        "word": "old",
+        "wall_ms": 7011.639931000001,
+        "input_ms": 6960,
+        "ref_end_ms": 6580.0,
+        "delay_ms": 431.6399310000006
+      },
+      {
+        "index": 22,
+        "word": "portrait",
+        "wall_ms": 7495.044779,
+        "input_ms": 7435,
+        "ref_end_ms": 7140.0,
+        "delay_ms": 355.04477899999983
+      }
+    ],
+    "latency": {
+      "count": 23,
+      "p50_ms": 510.14095599999973,
+      "p95_ms": 820.5924880000002,
+      "max_ms": 1309.148045,
+      "misses_500ms": 13
+    },
+    "stt_within_500ms": false,
+    "word_error_rate": 0.0
+  }
+}

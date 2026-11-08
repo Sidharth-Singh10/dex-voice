@@ -1,0 +1,4 @@
+# The vendored transcribe.cpp links the system `libblas`, whose CBLAS symbols
+# live in `libcblas` on this distribution. Append it to the link line.
+[build]
+rustflags = ["-C", "link-arg=-lcblas"]

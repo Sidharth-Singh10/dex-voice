@@ -1,0 +1,13 @@
+[package]
+name = "dex-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1"
+cpal = { version = "0.18", features = ["pulseaudio"] }
+
+[lints]
+workspace = true

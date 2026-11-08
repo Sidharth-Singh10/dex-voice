@@ -1,0 +1,55 @@
+{
+  "model": "../models/gguf/parakeet-unified-en-0.6b-F16.gguf",
+  "wav": "../models/parakeet-240ms/test_wavs/0.wav",
+  "backend": "vulkan",
+  "device": {
+    "name": "Vulkan1",
+    "description": "NVIDIA GeForce RTX 3050 4GB Laptop GPU",
+    "kind": "vulkan",
+    "device_type": "Gpu",
+    "memory_total_mib": 4096,
+    "memory_free_mib": 3100
+  },
+  "capabilities": {
+    "sample_rate": 16000,
+    "supports_streaming": true,
+    "max_audio_ms": 0,
+    "languages": [
+      "en"
+    ]
+  },
+  "reference_words": 23,
+  "gpu_peak_mib": 2113,
+  "offline": null,
+  "stream": {
+    "left_ms": 5600,
+    "chunk_ms": 160,
+    "right_ms": 80,
+    "commit_policy": "auto",
+    "commit_agreement": 0,
+    "source": "tokens",
+    "text": "Well, I don't wish to see it any more, observed Phoebe, turning away her eyes it is certainly very like the old portrait",
+    "audio_ms": 7435.0,
+    "wall_ms": 7487.011528,
+    "rtf": 0.9930530989827534,
+    "events": [
+      {
+        "index": 0,
+        "word": " Well, I don't wish to see it any more, observed Phoebe, turning away her eyes it is certainly very like the old portrait",
+        "wall_ms": 7486.994224,
+        "input_ms": 7435,
+        "ref_end_ms": null,
+        "delay_ms": null
+      }
+    ],
+    "latency": {
+      "count": 0,
+      "p50_ms": null,
+      "p95_ms": null,
+      "max_ms": null,
+      "misses_500ms": 0
+    },
+    "stt_within_500ms": null,
+    "word_error_rate": 1.0
+  }
+}
