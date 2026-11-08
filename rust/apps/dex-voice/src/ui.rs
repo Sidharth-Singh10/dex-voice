@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use dex_core::State as EngineState;
+use dex_core::{FailureDomain, State as EngineState};
 use rune::{Color, Cx, El, Icon, ScrollSpec, TextStyle, Tx, col, el, icon, oklch, row, text};
 use rune_kit::{
     Button, ButtonVariant, ControlSize, IconButton, IconButtonVariant, Kit, Loader, PaletteFocus,
@@ -139,6 +139,14 @@ fn status_copy(s: &State, k: &Kit) -> StatusCopy {
         };
     }
     match s.status.state {
+        EngineState::Idle if s.status.warning.as_deref() == Some("shutdown_incomplete") => {
+            StatusCopy {
+                title: "Stopped with a warning",
+                chip: "Incomplete".into(),
+                detail: "The last shutdown timed out. Audio is idle; start again when ready.".into(),
+                color: k.c.warning.fg,
+            }
+        }
         EngineState::Idle => StatusCopy {
             title: "Ready",
             chip: "Idle".into(),
@@ -171,11 +179,32 @@ fn status_copy(s: &State, k: &Kit) -> StatusCopy {
             detail: "Finishing the current phrase and closing the audio devices.".into(),
             color: k.c.text_muted,
         },
-        EngineState::Failed => StatusCopy {
-            title: "Needs attention",
-            chip: "Failed".into(),
-            detail: failed_detail(s.engine.is_some()).into(),
-            color: k.c.danger.fg,
+        EngineState::Recovering => StatusCopy {
+            title: "Reconnecting audio",
+            chip: "Device recovering".into(),
+            detail: "The output device stopped consuming audio. Dex Voice is reopening it once."
+                .into(),
+            color: k.c.warning.fg,
+        },
+        EngineState::Failed => match s.status.failure_domain {
+            FailureDomain::Synthesis => StatusCopy {
+                title: "Speech unavailable",
+                chip: "Synthesis failed".into(),
+                detail: "The speech synthesiser stopped responding or failed. Recognition is not the problem; restart the bridge to recover.".into(),
+                color: k.c.danger.fg,
+            },
+            FailureDomain::Device => StatusCopy {
+                title: "Audio device lost",
+                chip: "Device failed".into(),
+                detail: "The output device could not be recovered. Check the virtual microphone, then press Start again.".into(),
+                color: k.c.danger.fg,
+            },
+            FailureDomain::None => StatusCopy {
+                title: "Needs attention",
+                chip: "Failed".into(),
+                detail: failed_detail(s.engine.is_some()).into(),
+                color: k.c.danger.fg,
+            },
         },
     }
 }
@@ -1287,6 +1316,49 @@ mod tests {
             .expect("error banner");
         assert_eq!(banner.label.as_deref(), None);
         assert!(body_text(&rt).contains("no GPU matching"));
+    }
+
+    #[test]
+    fn synthesis_failure_is_not_reported_as_a_device_failure() {
+        let mut state = State::test_fixture();
+        state.status.state = EngineState::Failed;
+        state.status.failure_domain = FailureDomain::Synthesis;
+        state.status.synthesis_state = dex_core::SynthesisState::Stalled;
+        let text = body_text(&runtime(state, (900.0, 640.0)));
+        assert!(text.contains("Speech unavailable"));
+        assert!(text.contains("Synthesis failed"));
+        assert!(!text.contains("Audio device lost"));
+    }
+
+    #[test]
+    fn device_failure_is_not_reported_as_a_synthesis_failure() {
+        let mut state = State::test_fixture();
+        state.status.state = EngineState::Failed;
+        state.status.failure_domain = FailureDomain::Device;
+        state.status.device_state = dex_core::DeviceState::Lost;
+        let text = body_text(&runtime(state, (900.0, 640.0)));
+        assert!(text.contains("Audio device lost"));
+        assert!(text.contains("Device failed"));
+        assert!(!text.contains("Speech unavailable"));
+    }
+
+    #[test]
+    fn recovering_state_says_the_device_is_reopening() {
+        let mut state = State::test_fixture();
+        state.status.state = EngineState::Recovering;
+        let text = body_text(&runtime(state, (900.0, 640.0)));
+        assert!(text.contains("Reconnecting audio"));
+        assert!(text.contains("Device recovering"));
+    }
+
+    #[test]
+    fn incomplete_shutdown_is_visible_in_idle() {
+        let mut state = State::test_fixture();
+        state.status.state = EngineState::Idle;
+        state.status.warning = Some("shutdown_incomplete".into());
+        let text = body_text(&runtime(state, (900.0, 640.0)));
+        assert!(text.contains("Stopped with a warning"));
+        assert!(text.contains("Incomplete"));
     }
 
     #[test]

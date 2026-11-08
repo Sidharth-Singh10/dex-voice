@@ -15,7 +15,10 @@ use dex_audio::{
     Capture, DeviceChoice, PcmQueue, Playback, Resampler, device_choices, output_sample_rate,
     start_capture, start_playback,
 };
-use dex_core::{Engine, EngineConfig, State as EngineState, Status};
+use dex_core::{
+    DeviceAction, DeviceState, Engine, EngineConfig, FailureDomain, State as EngineState, Status,
+    Supervisor,
+};
 use rune::{AppSpec, TextEdit, Tx};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,6 +48,10 @@ struct State {
     error: Option<String>,
     last_poll: Instant,
     output_rate: u32,
+    closing: bool,
+    supervisor: Supervisor,
+    last_pops: u64,
+    last_pop_change: Instant,
 }
 
 impl Default for State {
@@ -70,6 +77,10 @@ impl Default for State {
             error: None,
             last_poll: Instant::now() - Duration::from_secs(1),
             output_rate: 48_000,
+            closing: false,
+            supervisor: Supervisor::new(),
+            last_pops: 0,
+            last_pop_change: Instant::now(),
         };
         // Device names are needed by the console's routing panel before Settings
         // is opened. This only enumerates; it never opens a stream or changes a
@@ -218,6 +229,13 @@ impl State {
                 "Select the virtual microphone output in Settings before starting. Do not use system-default speakers."
             );
         }
+        if dex_core::generation_retired_pending() {
+            anyhow::bail!("The previous engine is still shutting down. Start again in a moment.");
+        }
+        // Supervisory budgets are per engine generation.
+        self.supervisor = Supervisor::new();
+        self.last_pops = 0;
+        self.last_pop_change = Instant::now();
         let rate = output_sample_rate(&settings.output_device)?;
         // Favor complete playback while latency tuning is deferred.
         let queue = Arc::new(PcmQueue::new(rate as usize * 30));
@@ -245,12 +263,19 @@ impl State {
     }
 
     fn stop(&mut self) {
-        self.stop_devices();
-        if let Some(engine) = self.engine.take() {
-            engine.stop();
-            self.status = engine.status();
+        // The UI never joins workers. Close capture, ask the engine to finish
+        // its tail and drain in a control thread, then release playback once a
+        // terminal state arrives (see `poll`).
+        if let Some(engine) = &self.engine {
+            engine.request_stop();
         }
-        self.queue = None;
+        self.capture.take();
+        self.raw_tx.take();
+        self.feeder.take();
+        self.closing = true;
+        if self.engine.is_some() && self.status.state != EngineState::Failed {
+            self.status.state = EngineState::Stopping;
+        }
         let _ = config::save(&self.settings);
     }
 
@@ -291,17 +316,18 @@ impl State {
         self.capture.take();
         self.raw_tx.take();
         self.playback.take();
-        if let Some(feeder) = self.feeder.take() {
-            let _ = feeder.join();
-        }
+        // Dropping the handle detaches the feeder; it exits when the capture
+        // channel closes. The UI must not block on a worker join.
+        self.feeder.take();
     }
 
     fn cleanup(&mut self) {
-        self.stop_devices();
-        if let Some(engine) = self.engine.take() {
-            engine.stop();
+        if let Some(engine) = &self.engine {
+            engine.request_stop();
         }
+        self.stop_devices();
         self.queue = None;
+        self.closing = true;
     }
 }
 
@@ -415,6 +441,10 @@ impl State {
             error: None,
             last_poll: Instant::now() - Duration::from_secs(1),
             output_rate: 48_000,
+            closing: false,
+            supervisor: Supervisor::new(),
+            last_pops: 0,
+            last_pop_change: Instant::now(),
         }
     }
 }
@@ -425,13 +455,106 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
         return false;
     }
     s.last_poll = Instant::now();
+    let mut changed = false;
+
+    // Finish an asynchronous stop: the engine control thread owns the bounded
+    // drain/join, so the UI only observes the terminal state and then releases
+    // playback.
+    if s.closing {
+        if let Some(engine) = &s.engine {
+            let mut status = engine.status();
+            // A device failure that originated in the app is not visible in the
+            // engine's status; keep it while the engine finishes stopping.
+            if s.status.state == EngineState::Failed
+                && s.status.failure_domain == FailureDomain::Device
+            {
+                status.state = EngineState::Failed;
+                status.failure_domain = FailureDomain::Device;
+                status.device_state = DeviceState::Lost;
+                status.error = s.status.error.clone();
+            }
+            let terminal = matches!(
+                status.state,
+                EngineState::Idle | EngineState::Failed | EngineState::Recovering
+            );
+            s.status = status;
+            if terminal {
+                s.playback.take();
+                s.queue = None;
+                s.engine = None;
+                s.closing = false;
+            }
+        } else {
+            s.closing = false;
+        }
+        changed = true;
+        return changed;
+    }
+
     let Some(engine) = s.engine.clone() else {
-        return false;
+        return changed;
     };
     let mut status = engine.status();
     refresh_queue(&mut status, s.queue.as_deref(), s.output_rate);
+    status.device_state = s.supervisor.device;
     let previous = s.status.clone();
-    let mut changed = status != s.status;
+    let mut changed = changed || status != s.status;
+
+    // A playback that stops consuming queued audio for two seconds is a device
+    // stall, not a synthesis failure. Reopen exactly once, then fail the device
+    // domain.
+    if status.state == EngineState::Running
+        && s.capture.is_some()
+        && let Some(queue) = s.queue.clone()
+    {
+        let pops = queue.pops();
+        if pops != s.last_pops {
+            s.last_pops = pops;
+            s.last_pop_change = Instant::now();
+        } else if !queue.is_empty() && s.last_pop_change.elapsed() > Duration::from_secs(2) {
+            match s.supervisor.on_playback_stall() {
+                DeviceAction::Reopen => {
+                    s.playback.take();
+                    let cleared = queue.clear();
+                    match start_playback(&s.settings.output_device, Arc::clone(&queue)) {
+                        Ok(playback) => {
+                            s.playback = Some(playback);
+                            s.supervisor.on_playback_recovered();
+                            status.device_state = s.supervisor.device;
+                            status.device_recoveries = s.supervisor.device_recoveries() as u64;
+                            status.queue_cleared_samples += cleared as u64;
+                            s.last_pop_change = Instant::now();
+                        }
+                        Err(error) => {
+                            s.supervisor.fail_device();
+                            status.device_state = DeviceState::Lost;
+                            status.failure_domain = FailureDomain::Device;
+                            status.state = EngineState::Failed;
+                            status.error = Some(format!("Audio device recovery failed: {error:#}"));
+                            s.error = status.error.clone();
+                            engine.request_stop();
+                            s.stop_devices();
+                            s.closing = true;
+                        }
+                    }
+                }
+                DeviceAction::Fail => {
+                    s.supervisor.fail_device();
+                    status.device_state = DeviceState::Lost;
+                    status.failure_domain = FailureDomain::Device;
+                    status.device_recovery_failures += 1;
+                    status.state = EngineState::Failed;
+                    status.error = Some("Audio output stalled and could not be recovered.".into());
+                    s.error = status.error.clone();
+                    engine.request_stop();
+                    s.stop_devices();
+                    s.closing = true;
+                }
+            }
+            changed = true;
+        }
+    }
+
     s.status = status;
     if s.status.transcript != previous.transcript || s.status.state != previous.state {
         eprintln!(
@@ -452,7 +575,7 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
             changed = true;
         }
     }
-    if s.status.state == EngineState::Failed {
+    if s.status.state == EngineState::Failed && !s.closing {
         s.stop_devices();
     }
     changed

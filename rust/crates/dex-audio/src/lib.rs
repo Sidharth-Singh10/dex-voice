@@ -7,6 +7,7 @@ pub use trimmer::Trimmer;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use cpal::FromSample;
@@ -66,6 +67,10 @@ pub struct PcmQueue {
     samples: Mutex<VecDeque<f32>>,
     capacity: usize,
     dropped: AtomicU64,
+    pops: AtomicU64,
+    /// Updated only when a pop actually returned samples. A consumer that is
+    /// running but starving must not look like useful output work.
+    last_pop: Mutex<Option<Instant>>,
 }
 
 impl PcmQueue {
@@ -74,6 +79,8 @@ impl PcmQueue {
             samples: Mutex::new(VecDeque::with_capacity(capacity)),
             capacity,
             dropped: AtomicU64::new(0),
+            pops: AtomicU64::new(0),
+            last_pop: Mutex::new(None),
         }
     }
 
@@ -91,12 +98,22 @@ impl PcmQueue {
 
     /// Fills `output` with queued samples, zero-padding an underrun.
     pub fn pop_into(&self, output: &mut [f32]) -> usize {
+        self.pop_into_at(output, Instant::now())
+    }
+
+    /// Test/clock-injected pop. The liveness timestamp uses the caller's clock
+    /// so a hermetic test can advance time without sleeping.
+    pub fn pop_into_at(&self, output: &mut [f32], now: Instant) -> usize {
         let mut samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());
         let count = output.len().min(samples.len());
         for (slot, sample) in output.iter_mut().zip(samples.drain(..count)) {
             *slot = sample;
         }
         output[count..].fill(0.0);
+        if count > 0 {
+            self.pops.fetch_add(1, Ordering::Relaxed);
+            *self.last_pop.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+        }
         count
     }
 
@@ -110,6 +127,24 @@ impl PcmQueue {
 
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    pub fn pops(&self) -> u64 {
+        self.pops.load(Ordering::Relaxed)
+    }
+
+    /// Timestamp of the last pop that returned audio, if any.
+    pub fn last_pop(&self) -> Option<Instant> {
+        *self.last_pop.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Discards queued audio. Returns the number of samples removed. Used when a
+    /// cancelled phrase must not leave late PCM behind.
+    pub fn clear(&self) -> usize {
+        let mut samples = self.samples.lock().unwrap_or_else(|e| e.into_inner());
+        let count = samples.len();
+        samples.clear();
+        count
     }
 }
 
@@ -305,12 +340,16 @@ pub fn start_capture(
         cpal::SampleFormat::F64 => input_stream::<f64>(&device, stream_config, channels, on_block)?,
         cpal::SampleFormat::I8 => input_stream::<i8>(&device, stream_config, channels, on_block)?,
         cpal::SampleFormat::I16 => input_stream::<i16>(&device, stream_config, channels, on_block)?,
-        cpal::SampleFormat::I24 => input_stream::<cpal::I24>(&device, stream_config, channels, on_block)?,
+        cpal::SampleFormat::I24 => {
+            input_stream::<cpal::I24>(&device, stream_config, channels, on_block)?
+        }
         cpal::SampleFormat::I32 => input_stream::<i32>(&device, stream_config, channels, on_block)?,
         cpal::SampleFormat::I64 => input_stream::<i64>(&device, stream_config, channels, on_block)?,
         cpal::SampleFormat::U8 => input_stream::<u8>(&device, stream_config, channels, on_block)?,
         cpal::SampleFormat::U16 => input_stream::<u16>(&device, stream_config, channels, on_block)?,
-        cpal::SampleFormat::U24 => input_stream::<cpal::U24>(&device, stream_config, channels, on_block)?,
+        cpal::SampleFormat::U24 => {
+            input_stream::<cpal::U24>(&device, stream_config, channels, on_block)?
+        }
         cpal::SampleFormat::U32 => input_stream::<u32>(&device, stream_config, channels, on_block)?,
         cpal::SampleFormat::U64 => input_stream::<u64>(&device, stream_config, channels, on_block)?,
         other => return Err(anyhow!("unsupported input sample format {other:?}")),
@@ -349,12 +388,16 @@ pub fn start_playback(device_name: &str, queue: Arc<PcmQueue>) -> Result<Playbac
         cpal::SampleFormat::F64 => output_stream::<f64>(&device, stream_config, channels, queue)?,
         cpal::SampleFormat::I8 => output_stream::<i8>(&device, stream_config, channels, queue)?,
         cpal::SampleFormat::I16 => output_stream::<i16>(&device, stream_config, channels, queue)?,
-        cpal::SampleFormat::I24 => output_stream::<cpal::I24>(&device, stream_config, channels, queue)?,
+        cpal::SampleFormat::I24 => {
+            output_stream::<cpal::I24>(&device, stream_config, channels, queue)?
+        }
         cpal::SampleFormat::I32 => output_stream::<i32>(&device, stream_config, channels, queue)?,
         cpal::SampleFormat::I64 => output_stream::<i64>(&device, stream_config, channels, queue)?,
         cpal::SampleFormat::U8 => output_stream::<u8>(&device, stream_config, channels, queue)?,
         cpal::SampleFormat::U16 => output_stream::<u16>(&device, stream_config, channels, queue)?,
-        cpal::SampleFormat::U24 => output_stream::<cpal::U24>(&device, stream_config, channels, queue)?,
+        cpal::SampleFormat::U24 => {
+            output_stream::<cpal::U24>(&device, stream_config, channels, queue)?
+        }
         cpal::SampleFormat::U32 => output_stream::<u32>(&device, stream_config, channels, queue)?,
         cpal::SampleFormat::U64 => output_stream::<u64>(&device, stream_config, channels, queue)?,
         other => return Err(anyhow!("unsupported output sample format {other:?}")),
@@ -370,6 +413,7 @@ pub fn start_playback(device_name: &str, queue: Arc<PcmQueue>) -> Result<Playbac
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn resampler_is_continuous_across_chunks() {
@@ -418,5 +462,35 @@ mod tests {
         let mut output = [0.0; 4];
         assert_eq!(queue.pop_into(&mut output), 2);
         assert_eq!(output, [1.0, 2.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn last_pop_only_advances_when_samples_were_returned() {
+        let queue = PcmQueue::new(4);
+        let now = Instant::now();
+        let mut output = [0.0; 4];
+        assert_eq!(queue.pop_into_at(&mut output, now), 0);
+        assert_eq!(queue.last_pop(), None);
+        queue.push(&[1.0, 2.0]);
+        assert_eq!(
+            queue.pop_into_at(&mut output, now + Duration::from_millis(20)),
+            2
+        );
+        assert_eq!(queue.last_pop(), Some(now + Duration::from_millis(20)));
+        assert_eq!(
+            queue.pop_into_at(&mut output, now + Duration::from_millis(40)),
+            0
+        );
+        assert_eq!(queue.last_pop(), Some(now + Duration::from_millis(20)));
+        assert_eq!(queue.pops(), 1);
+    }
+
+    #[test]
+    fn clear_counts_and_discards_queued_audio() {
+        let queue = PcmQueue::new(8);
+        queue.push(&[1.0; 5]);
+        assert_eq!(queue.clear(), 5);
+        assert!(queue.is_empty());
+        assert_eq!(queue.clear(), 0);
     }
 }

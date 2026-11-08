@@ -7,23 +7,26 @@ use std::time::Instant;
 
 use dex_audio::PcmQueue;
 use dex_core::{
-    FinalizeOutcome, Group, PhraseSink, RealClock, ScriptedRecognizer, ScriptedSpec, ScriptedStep,
-    ScriptedText, Status, run_loop,
+    Dispatch, EndpointConfig, FinalizeOutcome, InFlight, PhraseSink, RealClock, ScriptedRecognizer,
+    ScriptedSpec, ScriptedStep, ScriptedText, SendOutcome, Status, run_loop,
 };
 
 #[derive(Default)]
 struct RecordingSink {
-    groups: Mutex<Vec<Group>>,
+    groups: Mutex<Vec<(Vec<String>, Instant)>>,
 }
 
 impl PhraseSink for RecordingSink {
-    fn send(&self, group: Group) -> bool {
-        self.groups.lock().unwrap().push(group);
-        true
+    fn try_send(&self, dispatch: Dispatch) -> SendOutcome {
+        self.groups
+            .lock()
+            .unwrap()
+            .push((dispatch.words, dispatch.at));
+        SendOutcome::Sent
     }
 }
 
-fn run(spec: ScriptedSpec) -> Vec<Vec<String>> {
+fn run(spec: ScriptedSpec) -> Vec<(Vec<String>, Instant)> {
     let (tx, rx) = sync_channel::<Vec<f32>>(4);
     tx.send(vec![0.5; 320]).unwrap();
     drop(tx);
@@ -31,6 +34,7 @@ fn run(spec: ScriptedSpec) -> Vec<Vec<String>> {
     let sink = Arc::new(RecordingSink::default());
     let status = Arc::new(Mutex::new(Status::default()));
     let output = PcmQueue::new(4096);
+    let inflight = InFlight::new();
     let sink_thread = Arc::clone(&sink);
     let status_thread = Arc::clone(&status);
     thread::spawn(move || {
@@ -41,17 +45,15 @@ fn run(spec: ScriptedSpec) -> Vec<Vec<String>> {
             &status_thread,
             &output,
             &RealClock,
+            &inflight,
+            EndpointConfig::default(),
+            None,
         )
         .unwrap();
     })
     .join()
     .unwrap();
-    sink.groups
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|group| group.words.clone())
-        .collect()
+    sink.groups.lock().unwrap().clone()
 }
 
 #[test]
@@ -64,7 +66,9 @@ fn committed_phrase_is_flushed_when_input_ends() {
         finalize: FinalizeOutcome::Final(ScriptedText::new("hello ", "")),
         feed_error_at: None,
     };
-    assert_eq!(run(spec), vec![vec!["hello".to_owned()]]);
+    let groups = run(spec);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].0, vec!["hello".to_owned()]);
 }
 
 #[test]
@@ -77,7 +81,9 @@ fn trailing_word_is_recovered_by_finalize() {
         finalize: FinalizeOutcome::Final(ScriptedText::new("hello", "")),
         feed_error_at: None,
     };
-    assert_eq!(run(spec), vec![vec!["hello".to_owned()]]);
+    let groups = run(spec);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].0, vec!["hello".to_owned()]);
 }
 
 #[test]
@@ -90,23 +96,7 @@ fn group_timestamp_is_monotonic() {
         finalize: FinalizeOutcome::Final(ScriptedText::new("hello ", "")),
         feed_error_at: None,
     };
-    let (tx, rx) = sync_channel::<Vec<f32>>(4);
-    tx.send(vec![0.5; 320]).unwrap();
-    drop(tx);
-    let mut recognizer = ScriptedRecognizer::new(vec![spec]);
-    let sink = Arc::new(RecordingSink::default());
-    let status = Arc::new(Mutex::new(Status::default()));
-    let output = PcmQueue::new(4096);
     let before = Instant::now();
-    run_loop(
-        rx,
-        &mut recognizer,
-        sink.as_ref(),
-        &status,
-        &output,
-        &RealClock,
-    )
-    .unwrap();
-    let groups = sink.groups.lock().unwrap();
-    assert!(groups[0].at >= before);
+    let groups = run(spec);
+    assert!(groups[0].1 >= before);
 }
