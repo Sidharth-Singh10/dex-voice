@@ -8,15 +8,20 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use dex_audio::{PcmQueue, Resampler, Trimmer};
 use ptts::checkpoint::{Checkpoint, ResolveOptions};
 use ptts::preprocess::Lang;
 use ptts::synth::{DeviceKind, Quant, SpeechOptions};
 use serde::Serialize;
-use transcribe_cpp::{
-    Backend, DeviceType, Model, ModelOptions, ParakeetBufferedStreamOptions, RunOptions,
-    StreamExtension, StreamOptions, TimestampKind, devices, init_backends_default,
+
+mod clock;
+mod recognizer;
+
+pub use clock::{Clock, ManualClock, RealClock};
+pub use recognizer::{
+    FeedUpdate, FinalizeOutcome, RecogStream, Recognizer, ScriptedRecognizer, ScriptedSpec,
+    ScriptedStep, ScriptedText, TextSnapshot, TranscribeRecognizer,
 };
 
 #[derive(Clone, Debug)]
@@ -81,9 +86,31 @@ pub struct Status {
     pub input_paused: bool,
 }
 
-struct Group {
-    words: Vec<String>,
-    at: Instant,
+pub struct Group {
+    pub words: Vec<String>,
+    pub at: Instant,
+}
+
+/// Destination for a completed phrase.
+pub trait PhraseSink {
+    fn send(&self, group: Group) -> bool;
+}
+
+/// Real sink: a blocking send to the speech worker.
+pub struct ChannelSink {
+    tx: SyncSender<Option<Group>>,
+}
+
+impl ChannelSink {
+    pub fn new(tx: SyncSender<Option<Group>>) -> Self {
+        Self { tx }
+    }
+}
+
+impl PhraseSink for ChannelSink {
+    fn send(&self, group: Group) -> bool {
+        self.tx.send(Some(group)).is_ok()
+    }
 }
 
 /// Input gating state used to avoid recognizing our own synthesized speech.
@@ -235,12 +262,13 @@ fn asr_loop(
 /// Finalizes the current stream, queues anything it has recognized, and
 /// returns false when the speech worker has gone away.
 fn flush_stream(
-    stream: &mut transcribe_cpp::Stream<'_>,
+    stream: &mut dyn RecogStream,
     seen: &mut usize,
     pending: &mut Vec<String>,
     first_at: &mut Option<Instant>,
-    groups: &SyncSender<Option<Group>>,
+    sink: &dyn PhraseSink,
     status: &Arc<Mutex<Status>>,
+    now: Instant,
 ) -> bool {
     let _ = stream.finalize();
     // After finalize the raw hypothesis is authoritative, and the final word
@@ -254,9 +282,9 @@ fn flush_stream(
     }
     let group = Group {
         words: std::mem::take(pending),
-        at: first_at.take().unwrap_or_else(Instant::now),
+        at: first_at.take().unwrap_or(now),
     };
-    groups.send(Some(group)).is_ok()
+    sink.send(group)
 }
 
 fn asr_inner(
@@ -267,66 +295,23 @@ fn asr_inner(
     ready_count: &AtomicUsize,
     output: &PcmQueue,
 ) -> Result<()> {
-    init_backends_default().context("initialise transcribe.cpp backends")?;
-    let available = devices();
-    let wanted = config.device.to_lowercase();
-    let device = available
-        .iter()
-        .filter(|device| device.device_type != DeviceType::Cpu)
-        .find(|device| {
-            wanted.is_empty()
-                || device.description.to_lowercase().contains(&wanted)
-                || device.name.to_lowercase().contains(&wanted)
-        })
-        .cloned()
-        .ok_or_else(|| {
-            anyhow!(
-                "no GPU matching {:?}; saw {}",
-                config.device,
-                available
-                    .iter()
-                    .map(|d| d.description.clone())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })?;
-    let model = Model::load_with(
-        &config.asr_model,
-        &ModelOptions {
-            backend: Backend::Vulkan,
-            device: Some(device),
-            no_mmap: true,
-        },
-    )
-    .with_context(|| format!("load {}", config.asr_model.display()))?;
-    let mut session = model.session().context("create session")?;
-    let run = RunOptions {
-        timestamps: TimestampKind::Token,
-        ..RunOptions::default()
-    };
-    let stream_options = StreamOptions {
-        commit_policy: transcribe_cpp::CommitPolicy::Auto,
-        stable_prefix_agreement_n: 0,
-        family: Some(StreamExtension::ParakeetBuffered(
-            ParakeetBufferedStreamOptions {
-                left_ms: Some(config.left_ms),
-                chunk_ms: Some(config.chunk_ms),
-                right_ms: Some(config.right_ms),
-            },
-        )),
-    };
-    {
-        let mut warm = session
-            .stream(&run, &stream_options)
-            .context("warmup stream")?;
-        warm.feed(&vec![0.0; 8000]).context("warmup feed")?;
-        warm.finalize().context("warmup finalize")?;
-    }
+    let mut recognizer = TranscribeRecognizer::load(config)?;
     ready(status, ready_count);
+    let sink = ChannelSink::new(groups.clone());
+    run_loop(input, &mut recognizer, &sink, status, output, &RealClock)
+}
 
-    let mut stream = session
-        .stream(&run, &stream_options)
-        .context("start stream")?;
+/// The recognition/turn loop. Kept free of model loading so tests can drive it
+/// with a scripted recognizer and a manual clock.
+pub fn run_loop(
+    input: Receiver<Vec<f32>>,
+    recognizer: &mut dyn Recognizer,
+    sink: &dyn PhraseSink,
+    status: &Arc<Mutex<Status>>,
+    output: &PcmQueue,
+    clock: &dyn Clock,
+) -> Result<()> {
+    let mut stream = recognizer.open()?;
     let mut seen = 0usize;
     let mut pending: Vec<String> = Vec::new();
     let mut first_at: Option<Instant> = None;
@@ -350,30 +335,30 @@ fn asr_inner(
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
+        let now = clock.now();
         let playing = !output.is_empty();
         if playing {
-            last_playing = Some(Instant::now());
+            last_playing = Some(now);
         }
-        let speaking =
-            playing || last_playing.is_some_and(|at| at.elapsed() < Duration::from_millis(250));
+        let speaking = playing
+            || last_playing.is_some_and(|at| now.duration_since(at) < Duration::from_millis(250));
         if gate == Gate::Listening && speaking {
             gate = Gate::Speaking;
             // Flush what the stream has already read, then drop it so the echo
             // cannot leak into the next utterance.
             if !flush_stream(
-                &mut stream,
+                &mut *stream,
                 &mut seen,
                 &mut pending,
                 &mut first_at,
-                groups,
+                sink,
                 status,
+                now,
             ) {
                 break;
             }
             drop(stream);
-            stream = session
-                .stream(&run, &stream_options)
-                .context("restart stream when speech starts")?;
+            stream = recognizer.open()?;
             seen = 0;
             silence_since = None;
             quiet_since = None;
@@ -399,15 +384,14 @@ fn asr_inner(
             if rms >= ECHO_QUIET {
                 quiet_since = None;
             } else {
-                let since = *quiet_since.get_or_insert_with(Instant::now);
-                if since.elapsed() >= Duration::from_millis(150)
-                    || last_playing.is_some_and(|at| at.elapsed() > Duration::from_secs(10))
+                let since = *quiet_since.get_or_insert_with(|| clock.now());
+                if now.duration_since(since) >= Duration::from_millis(150)
+                    || last_playing
+                        .is_some_and(|at| now.duration_since(at) > Duration::from_secs(10))
                 {
                     gate = Gate::Listening;
                     drop(stream);
-                    stream = session
-                        .stream(&run, &stream_options)
-                        .context("restart stream after speaking")?;
+                    stream = recognizer.open()?;
                     seen = 0;
                     silence_since = None;
                     status
@@ -423,7 +407,7 @@ fn asr_inner(
         let rms = (block.iter().map(|v| v * v).sum::<f32>() / block.len().max(1) as f32).sqrt();
         if rms < 0.003 {
             if silence_since.is_none() && (seen > 0 || !pending.is_empty()) {
-                silence_since = Some(Instant::now());
+                silence_since = Some(now);
             }
         } else {
             silence_since = None;
@@ -433,54 +417,53 @@ fn asr_inner(
             let new_words = complete_words(&text, &mut seen);
             for word in &new_words {
                 if first_at.is_none() {
-                    first_at = Some(Instant::now());
+                    first_at = Some(clock.now());
                 }
                 pending.push(word.clone());
             }
             update_status(status, &new_words);
             if !new_words.is_empty() {
-                pending_since.get_or_insert_with(Instant::now);
+                pending_since.get_or_insert_with(|| clock.now());
             }
             // Words are spoken at a silence boundary (below). Speaking every few
             // words talks over the user, and without echo cancellation that
             // overlap feeds the app its own voice.
         }
-        if silence_since.is_some_and(|at| at.elapsed() >= Duration::from_millis(800)) {
+        if silence_since.is_some_and(|at| now.duration_since(at) >= Duration::from_millis(800)) {
             // The stream keeps the final word in its lookahead until finalize.
             // Silence is a natural boundary: flush, speak, and start fresh.
             if !flush_stream(
-                &mut stream,
+                &mut *stream,
                 &mut seen,
                 &mut pending,
                 &mut first_at,
-                groups,
+                sink,
                 status,
+                now,
             ) {
                 break;
             }
             drop(stream);
-            stream = session
-                .stream(&run, &stream_options)
-                .context("restart stream after silence")?;
+            stream = recognizer.open()?;
             seen = 0;
             silence_since = None;
             pending_since = None;
-        } else if pending_since.is_some_and(|at| at.elapsed() >= Duration::from_secs(10)) {
+        } else if pending_since.is_some_and(|at| now.duration_since(at) >= Duration::from_secs(10))
+        {
             // Uninterrupted speech: flush it rather than staying silent.
             if !flush_stream(
-                &mut stream,
+                &mut *stream,
                 &mut seen,
                 &mut pending,
                 &mut first_at,
-                groups,
+                sink,
                 status,
+                now,
             ) {
                 break;
             }
             drop(stream);
-            stream = session
-                .stream(&run, &stream_options)
-                .context("restart stream after long speech")?;
+            stream = recognizer.open()?;
             seen = 0;
             silence_since = None;
             pending_since = None;
@@ -493,10 +476,10 @@ fn asr_inner(
     pending.extend(tail_words.iter().cloned());
     update_status(status, &tail_words);
     if !pending.is_empty() {
-        let _ = groups.send(Some(Group {
+        let _ = sink.send(Group {
             words: pending,
-            at: first_at.unwrap_or_else(Instant::now),
-        }));
+            at: first_at.unwrap_or_else(|| clock.now()),
+        });
     }
     Ok(())
 }
