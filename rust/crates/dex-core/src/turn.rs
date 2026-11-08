@@ -111,6 +111,14 @@ impl InFlight {
             .clone()
     }
 
+    pub fn active_id(&self) -> Option<u64> {
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|turn| turn.id)
+    }
+
     pub fn is_active(&self) -> bool {
         self.active
             .lock()
@@ -122,6 +130,22 @@ impl InFlight {
     pub fn cancel_active(&self) -> bool {
         let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         active.as_ref().is_some_and(|turn| turn.cancel())
+    }
+
+    /// Cancels only if the active turn still has `id`. A stale watchdog must
+    /// never touch a newer turn.
+    pub fn cancel_turn(&self, id: u64) -> bool {
+        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        active
+            .as_ref()
+            .filter(|turn| turn.id == id)
+            .is_some_and(|turn| turn.cancel())
+    }
+
+    /// Releases an unacknowledged turn so the output gate cannot stay blocked
+    /// forever. Late worker activity is already blocked by the cancel flag.
+    pub fn force_release(&self, id: u64) -> bool {
+        self.release(id)
     }
 
     /// Releases the slot if `id` still matches. Returns true on release.

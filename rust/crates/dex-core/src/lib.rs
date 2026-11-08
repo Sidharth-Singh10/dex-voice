@@ -30,8 +30,8 @@ pub use endpoint::{
     EndpointConfig, EndpointEvent, EndpointReason, FrameSplitter, PhraseClock, rms,
 };
 pub use failure::{
-    CancelWatch, DeviceAction, DeviceState, DisconnectAction, FailureDomain, StopOutcome,
-    Supervisor, SynthesisState, stop_outcome,
+    CancelWatch, DeviceAction, DeviceState, DisconnectAction, FailureDomain, NO_PCM_CANCEL_MS,
+    StopOutcome, Supervisor, SynthesisState, TurnWatch, TurnWatchAction, stop_outcome,
 };
 pub use recognizer::{
     FeedUpdate, FinalizeOutcome, RecogStream, Recognizer, ScriptedRecognizer, ScriptedSpec,
@@ -49,6 +49,7 @@ pub const CANCEL_ACK_MS: u64 = 1_500;
 /// Bounded stop joins.
 pub const STOP_DRAIN_MS: u64 = 1_500;
 pub const STOP_JOIN_MS: u64 = 2_000;
+pub const STOP_CONTROL_MS: u64 = 8_000;
 /// Consecutive synthesis failures before the speech domain is declared failed.
 pub const SYNTHESIS_FAILURE_LIMIT: u64 = 3;
 /// Keep telemetry bounded for a long-running session.
@@ -133,6 +134,7 @@ pub struct Status {
     pub busy_drops: u64,
     pub dispatch_failures: u64,
     pub finalize_errors: u64,
+    pub finalize_tail_loss: u64,
     pub empty_finalize: u64,
     pub degraded_finalize: u64,
     pub idle_cap_resets: u64,
@@ -142,6 +144,7 @@ pub struct Status {
     pub tts_restarts: u64,
     pub tts_restart_failures: u64,
     pub synthesis_stalls: u64,
+    pub cancel_requests: u64,
     pub cancel_timeouts: u64,
     pub device_recoveries: u64,
     pub device_recovery_failures: u64,
@@ -425,7 +428,6 @@ impl Engine {
         if self.stop_requested.swap(true, Ordering::SeqCst) {
             return;
         }
-        retire_generation();
         self.stopping.store(true, Ordering::SeqCst);
         drop(self.input.lock().unwrap_or_else(|e| e.into_inner()).take());
         self.inflight.cancel_active();
@@ -453,16 +455,24 @@ impl Engine {
     }
 
     /// Blocking stop used by non-UI binaries. The UI calls [`request_stop`].
+    /// The join is bounded to [`STOP_CONTROL_MS`] so a caller can never block
+    /// forever on a worker thread.
     pub fn stop(&self) {
         self.request_stop();
-        if let Some(handle) = self
+        let handle = self
             .stop_thread
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
-            let _ = handle.join();
+            .take();
+        if let Some(handle) = handle {
+            let _ = join_with_timeout(vec![handle], Duration::from_millis(STOP_CONTROL_MS));
         }
+    }
+
+    /// Records a capture block dropped at the device callback because the
+    /// feeder channel was full or closed.
+    pub fn note_capture_drop(&self) {
+        self.bump(|status| status.capture_drops += 1);
     }
 
     fn bump(&self, counter: impl FnOnce(&mut Status)) {
@@ -511,6 +521,11 @@ fn stop_control(
         Some(handle) => join_with_timeout(vec![handle], Duration::from_millis(STOP_JOIN_MS)),
         None => true,
     };
+    // A normal stop never marks the loader as orphan. Only mark it when the
+    // ASR thread actually fails to exit within the bound, i.e. a true orphan.
+    if !asr_joined && loader_active() {
+        retire_generation();
+    }
     sink.close();
 
     // Let the speech worker finish and the queue drain, bounded.
@@ -527,15 +542,16 @@ fn stop_control(
 
     let workers_joined = join_with_timeout(workers, Duration::from_millis(STOP_JOIN_MS));
     let joined = asr_joined && workers_joined;
+    let timed_out = !joined || drain_timed_out;
     let mut st = status.lock().unwrap_or_else(|e| e.into_inner());
     if st.state != State::Failed {
-        if st.device_state == DeviceState::Recovering {
-            st.state = State::Recovering;
-        } else {
-            st.state = State::Idle;
-        }
+        let outcome = stop_outcome(st.device_state == DeviceState::Recovering, timed_out);
+        st.state = match outcome {
+            StopOutcome::Recovering => State::Recovering,
+            _ => State::Idle,
+        };
     }
-    if !joined || drain_timed_out {
+    if timed_out {
         st.warning = Some("shutdown_incomplete".into());
         st.shutdown_incomplete_timeouts += 1;
         if st.state != State::Failed {
@@ -650,7 +666,22 @@ fn asr_inner(
     )
 }
 
-/// True when no output work exists and the post-pop guard has elapsed. ASR
+/// True when the engine has failed and the loop must stop recognising.
+fn is_failed(status: &Arc<Mutex<Status>>) -> bool {
+    status.lock().unwrap_or_else(|e| e.into_inner()).state == State::Failed
+}
+
+/// Publishes a 2 s no-PCM cancellation that was never acknowledged.
+fn apply_stall(status: &Arc<Mutex<Status>>, supervisor: &Supervisor, cleared: usize) {
+    let mut st = status.lock().unwrap_or_else(|e| e.into_inner());
+    st.cancel_timeouts += 1;
+    st.synthesis_stalls += 1;
+    st.failure_domain = supervisor.failure;
+    st.synthesis_state = supervisor.synthesis;
+    st.state = State::Failed;
+    st.error = Some("Speech: cancellation was not acknowledged".into());
+    st.queue_cleared_samples += cleared as u64;
+}
 /// work (a phrase waiting on finalize) is deliberately not output work.
 pub fn can_listen(inflight: &InFlight, output: &PcmQueue, now: Instant) -> bool {
     let no_output_work = !inflight.is_active() && inflight.channel_empty() && output.is_empty();
@@ -684,8 +715,24 @@ pub fn run_loop(
     let mut generation = 1u64;
     let mut gate = Gate::Listening;
     let mut finalize_failures = 0u64;
+    // Tracks whether the most recent endpoint produced no spoken words, so an
+    // EOF on the leftover empty stream is not counted a second time.
+    let mut just_finalized_empty = false;
+    // Production 2 s no-PCM watchdog. It owns the `Supervisor` that decides the
+    // failure domain, so there is no separate test-only cancellation path.
+    let mut watch = TurnWatch::new(
+        Duration::from_millis(NO_PCM_CANCEL_MS),
+        Duration::from_millis(CANCEL_ACK_MS),
+    );
+    let mut terminal = false;
 
     loop {
+        // A failed engine is terminal: stop recognising, never reset a zombie
+        // stream, and never emit a tail from it.
+        if is_failed(status) {
+            terminal = true;
+            break;
+        }
         if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
             break;
         }
@@ -695,6 +742,26 @@ pub fn run_loop(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
         let now = clock.now();
+        // The tick runs on every loop pass, including while muted: a turn that
+        // produces no PCM is cancelled at 2 s, then must acknowledge within
+        // 1.5 s or the synthesis domain stalls.
+        match watch.tick(now, inflight.active().as_deref()) {
+            TurnWatchAction::None => {}
+            TurnWatchAction::Cancel { id } => {
+                if inflight.cancel_turn(id) {
+                    bump(status, |s| s.cancel_requests += 1);
+                }
+            }
+            TurnWatchAction::Stalled { id } => {
+                // Release the stuck turn, clear anything it queued, and publish
+                // the stall. The input gate stays closed: never unmute.
+                inflight.force_release(id);
+                let cleared = output.clear();
+                apply_stall(status, watch.supervisor(), cleared);
+                terminal = true;
+                break;
+            }
+        }
         let listening = can_listen(inflight, output, now);
         if gate == Gate::Listening && !listening {
             // Fully muted while our own voice is queued, synthesizing, or
@@ -736,6 +803,9 @@ pub fn run_loop(
             let _ = update;
             let snapshot = stream.text();
             let display_nonempty = !snapshot.display.trim().is_empty();
+            if display_nonempty {
+                just_finalized_empty = false;
+            }
             if first_at.is_none() && display_nonempty {
                 first_at = Some(now);
             }
@@ -755,6 +825,7 @@ pub fn run_loop(
                     let failed = result.is_err();
                     let after = stream.text();
                     let words = emission_words(before, result, after, Some(reason), status);
+                    just_finalized_empty = words.is_none();
                     if failed {
                         finalize_failures += 1;
                     } else {
@@ -787,6 +858,14 @@ pub fn run_loop(
         }
     }
 
+    if terminal {
+        return Ok(());
+    }
+
+    if just_finalized_empty && !phrase.is_armed() {
+        return Ok(());
+    }
+
     // EOF: finalize the last phrase. Tail dispatch is exempt from the
     // one-in-flight assertion, but it still respects the single slot: if a
     // turn is live the tail is counted and dropped rather than queued.
@@ -797,7 +876,14 @@ pub fn run_loop(
     if let Some((words, marker)) = emission_words(before, result, after, None, status) {
         let at = first_at.unwrap_or_else(|| clock.now());
         let free = !inflight.is_active() && inflight.channel_empty();
-        if free {
+        if stop.is_some_and(|stop| stop.load(Ordering::SeqCst)) {
+            if free {
+                dispatch_stop_tail(words, at, generation, status, sink, inflight);
+            } else {
+                bump(status, |s| s.stop_tail_dropped += 1);
+                append_transcript(status, (generation, 0), &words, Some("[tail lost]"));
+            }
+        } else if free {
             dispatch_phrase(words, at, generation, marker, status, sink, inflight, at);
         } else {
             bump(status, |s| s.stop_tail_dropped += 1);
@@ -860,12 +946,25 @@ fn emission_words(
             }
             // Never trust a rewritable or tentative suffix after a non-final
             // finalize: speak only the committed words captured before it.
-            let words: Vec<String> = before
+            let mut words: Vec<String> = before
                 .committed
                 .split_whitespace()
                 .filter(|word| !word.is_empty())
                 .map(str::to_owned)
                 .collect();
+            // A committed tail without trailing whitespace is still tentative:
+            // drop it so a partial token can never reach speech or transcript.
+            if !words.is_empty()
+                && !before.committed.trim_end().is_empty()
+                && !before
+                    .committed
+                    .chars()
+                    .last()
+                    .is_some_and(char::is_whitespace)
+            {
+                words.pop();
+                bump(status, |s| s.finalize_tail_loss += 1);
+            }
             if words.is_empty() {
                 bump(status, |s| s.degraded_finalize += 1);
                 None
@@ -930,7 +1029,7 @@ fn dispatch_phrase_inner(
     let id = control.id;
     // Exactly one in-flight turn by construction; this catches a future
     // regression that reintroduces a second dispatch path.
-    debug_assert!(inflight.is_active());
+    debug_assert_eq!(inflight.active_id(), Some(id));
     let token = TurnToken::new(Arc::clone(inflight), control);
     let retry_words = words.clone();
     match sink.try_send(Dispatch {
@@ -984,6 +1083,50 @@ fn dispatch_phrase_inner(
                     "Speech: synthesis worker disconnected",
                 );
             }
+        }
+    }
+}
+
+/// Dispatches a phrase that is being flushed because the input is ending. A
+/// disconnected worker is a dropped tail, never a synthesis failure or restart.
+#[allow(clippy::too_many_arguments)]
+fn dispatch_stop_tail(
+    words: Vec<String>,
+    at: Instant,
+    generation: u64,
+    status: &Arc<Mutex<Status>>,
+    sink: &dyn PhraseSink,
+    inflight: &Arc<InFlight>,
+) {
+    if words.is_empty() {
+        return;
+    }
+    if inflight.is_active() || !inflight.channel_empty() {
+        bump(status, |s| s.stop_tail_dropped += 1);
+        append_transcript(status, (generation, 0), &words, Some("[tail lost]"));
+        return;
+    }
+    let Some(control) = inflight.begin(at) else {
+        bump(status, |s| s.stop_tail_dropped += 1);
+        append_transcript(status, (generation, 0), &words, Some("[tail lost]"));
+        return;
+    };
+    let id = control.id;
+    let token = TurnToken::new(Arc::clone(inflight), control);
+    let retry_words = words.clone();
+    match sink.try_send(Dispatch {
+        id,
+        words,
+        at,
+        token,
+    }) {
+        SendOutcome::Sent => {
+            append_transcript(status, (generation, id), &retry_words, None);
+        }
+        SendOutcome::Busy | SendOutcome::Disconnected => {
+            inflight.release_failed(id);
+            bump(status, |s| s.stop_tail_dropped += 1);
+            append_transcript(status, (generation, 0), &retry_words, Some("[tail lost]"));
         }
     }
 }
@@ -1179,6 +1322,7 @@ fn tts_inner(
         }
         if let Err(error) = result {
             bump(status, |s| s.synthesis_errors += 1);
+            append_marker(status, "[speech error]");
             let failures = status
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1323,6 +1467,7 @@ mod tests {
 
     #[test]
     fn loader_guard_refuses_a_second_loader_until_the_orphan_exits() {
+        let _lock = LOADER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Serialise against other tests that may touch the process-scoped flag.
         let guard = LoaderGuard::acquire().expect("first loader");
         assert!(LoaderGuard::acquire().is_none());
@@ -1447,5 +1592,49 @@ mod tests {
             Some((vec!["final".to_owned(), "words".to_owned()], None))
         );
         assert_eq!(status.lock().unwrap().endpoint_silence, 1);
+    }
+
+    #[test]
+    fn capture_drops_are_counted() {
+        let engine = test_engine(Status::default());
+        engine.note_capture_drop();
+        engine.note_capture_drop();
+        assert_eq!(engine.status().capture_drops, 2);
+    }
+
+    #[test]
+    fn join_with_timeout_bounds_close() {
+        let handle = thread::spawn(|| thread::sleep(Duration::from_secs(5)));
+        let started = Instant::now();
+        let joined = join_with_timeout(vec![handle], Duration::from_millis(50));
+        assert!(!joined);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    static LOADER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn normal_stop_does_not_mark_the_loader_as_orphan() {
+        let _lock = LOADER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = orphan_loader_exits();
+        let engine = test_engine(Status::default());
+        engine.stop();
+        assert!(!generation_retired_pending());
+        assert_eq!(orphan_loader_exits(), before);
+        let guard = LoaderGuard::acquire().expect("loader free after normal stop");
+        drop(guard);
+    }
+
+    #[test]
+    fn orphan_exit_is_counted_only_after_the_loader_actually_exits() {
+        let _lock = LOADER_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = orphan_loader_exits();
+        let guard = LoaderGuard::acquire().expect("first loader");
+        retire_generation();
+        assert!(generation_retired_pending());
+        assert_eq!(orphan_loader_exits(), before);
+        drop(guard);
+        assert_eq!(orphan_loader_exits(), before + 1);
+        assert!(!generation_retired_pending());
     }
 }

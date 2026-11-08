@@ -262,6 +262,12 @@ impl State {
         Ok(())
     }
 
+    fn cancel(&mut self) {
+        if let Some(engine) = &self.engine {
+            engine.cancel_speech();
+        }
+    }
+
     fn stop(&mut self) {
         // The UI never joins workers. Close capture, ask the engine to finish
         // its tail and drain in a control thread, then release playback once a
@@ -286,8 +292,11 @@ impl State {
             start_playback(&self.settings.output_device, queue).context("open playback device")?;
         let (tx, rx) = sync_channel::<Vec<f32>>(200);
         let stop_tx = tx.clone();
+        let capture_engine = Arc::clone(&engine);
         let capture = start_capture(&self.settings.input_device, move |block| {
-            let _ = tx.try_send(block);
+            if tx.try_send(block).is_err() {
+                capture_engine.note_capture_drop();
+            }
         })
         .context("open capture device")?;
         let input_rate = capture.sample_rate;
@@ -393,7 +402,18 @@ fn choose_voice_from(voices: &[String], label: &str) -> Option<String> {
         .map(|index| voices[index].clone())
 }
 
-/// Refresh the queue-derived parts of the status between engine snapshots.
+/// Preserve a more severe device state when merging the app supervisor's view
+/// with the engine's own device state.
+fn merge_device_state(a: dex_core::DeviceState, b: dex_core::DeviceState) -> dex_core::DeviceState {
+    use dex_core::DeviceState;
+    if a == DeviceState::Lost || b == DeviceState::Lost {
+        DeviceState::Lost
+    } else if a == DeviceState::Recovering || b == DeviceState::Recovering {
+        DeviceState::Recovering
+    } else {
+        DeviceState::Ready
+    }
+}
 /// The engine only writes these when a TTS chunk is committed, so playback and
 /// overflow need the live queue to avoid looking frozen.
 fn refresh_queue(status: &mut Status, queue: Option<&PcmQueue>, rate: u32) {
@@ -449,6 +469,14 @@ impl State {
     }
 }
 
+fn on_key(s: &mut State, event: &rune::KeyEvent, _tx: &mut rune::Tx) -> bool {
+    if event.key == rune::Key::Escape && !s.settings_open {
+        s.cancel();
+        return true;
+    }
+    false
+}
+
 fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
     tx.wake_after(Duration::from_millis(200));
     if s.last_poll.elapsed() < Duration::from_millis(200) {
@@ -496,7 +524,7 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
     };
     let mut status = engine.status();
     refresh_queue(&mut status, s.queue.as_deref(), s.output_rate);
-    status.device_state = s.supervisor.device;
+    status.device_state = merge_device_state(status.device_state, s.supervisor.device);
     let previous = s.status.clone();
     let mut changed = changed || status != s.status;
 
@@ -520,7 +548,8 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
                         Ok(playback) => {
                             s.playback = Some(playback);
                             s.supervisor.on_playback_recovered();
-                            status.device_state = s.supervisor.device;
+                            status.device_state =
+                                merge_device_state(status.device_state, s.supervisor.device);
                             status.device_recoveries = s.supervisor.device_recoveries() as u64;
                             status.queue_cleared_samples += cleared as u64;
                             s.last_pop_change = Instant::now();
@@ -693,6 +722,7 @@ fn main() {
             ("settings", scene_settings),
         ],
         poll: Some(poll),
+        on_key: Some(on_key),
         ..AppSpec::new("Dex Voice", (900.0, 640.0), State::default, ui::view)
     });
 }

@@ -8,6 +8,11 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+use crate::turn::TurnControl;
+
+/// A turn that produces no PCM within this window is cancelled and watched.
+pub const NO_PCM_CANCEL_MS: u64 = 2_000;
+
 /// Which subsystem owns a terminal failure.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -102,6 +107,12 @@ impl Supervisor {
         true
     }
 
+    pub fn on_cancel_requested(&mut self) {
+        if self.synthesis != SynthesisState::Failed {
+            self.synthesis = SynthesisState::Idle;
+        }
+    }
+
     pub fn on_playback_stall(&mut self) -> DeviceAction {
         if self.device_recoveries == 0 {
             self.device_recoveries = 1;
@@ -173,6 +184,83 @@ pub fn stop_outcome(device_recovering: bool, timed_out: bool) -> StopOutcome {
         StopOutcome::Recovering
     } else {
         StopOutcome::Idle
+    }
+}
+
+/// What the production tick should do about the current turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnWatchAction {
+    None,
+    /// The turn produced no PCM within the deadline: cancel this exact turn
+    /// and start the acknowledgement watch.
+    Cancel {
+        id: u64,
+    },
+    /// The cancel was not acknowledged. The synthesis domain is stalled.
+    Stalled {
+        id: u64,
+    },
+}
+
+/// Production no-PCM cancel watchdog.
+///
+/// Drives the 2 s no-PCM deadline from [`TurnControl::created`] and the 1.5 s
+/// acknowledgement watch through [`CancelWatch`]. It owns the [`Supervisor`]
+/// so the failure domain and synthesis state are the same values the UI sees.
+#[derive(Clone, Debug)]
+pub struct TurnWatch {
+    supervisor: Supervisor,
+    no_pcm: Duration,
+    ack: Duration,
+    cancel_id: Option<u64>,
+    watch: Option<CancelWatch>,
+}
+
+impl TurnWatch {
+    pub fn new(no_pcm: Duration, ack: Duration) -> Self {
+        Self {
+            supervisor: Supervisor::new(),
+            no_pcm,
+            ack,
+            cancel_id: None,
+            watch: None,
+        }
+    }
+
+    pub fn supervisor(&self) -> &Supervisor {
+        &self.supervisor
+    }
+
+    pub fn supervisor_mut(&mut self) -> &mut Supervisor {
+        &mut self.supervisor
+    }
+
+    /// Observes one production tick. `active` is the current turn, if any.
+    pub fn tick(&mut self, now: Instant, active: Option<&TurnControl>) -> TurnWatchAction {
+        let Some(turn) = active else {
+            self.cancel_id = None;
+            self.watch = None;
+            return TurnWatchAction::None;
+        };
+
+        if self.cancel_id == Some(turn.id) {
+            if self.watch.as_ref().is_some_and(|watch| watch.expired(now)) {
+                self.supervisor.on_cancel_timeout();
+                return TurnWatchAction::Stalled { id: turn.id };
+            }
+            return TurnWatchAction::None;
+        }
+
+        // A different turn: drop any stale watch before evaluating it.
+        self.cancel_id = None;
+        self.watch = None;
+        if !turn.has_pcm() && now.saturating_duration_since(turn.created) >= self.no_pcm {
+            self.supervisor.on_cancel_requested();
+            self.cancel_id = Some(turn.id);
+            self.watch = Some(CancelWatch::new(now, self.ack));
+            return TurnWatchAction::Cancel { id: turn.id };
+        }
+        TurnWatchAction::None
     }
 }
 
