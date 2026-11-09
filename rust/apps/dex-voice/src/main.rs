@@ -52,6 +52,8 @@ struct State {
     supervisor: Supervisor,
     last_pops: u64,
     last_pop_change: Instant,
+    device_recovering: bool,
+    device_recovery_deadline: Option<Instant>,
 }
 
 impl Default for State {
@@ -81,6 +83,8 @@ impl Default for State {
             supervisor: Supervisor::new(),
             last_pops: 0,
             last_pop_change: Instant::now(),
+            device_recovering: false,
+            device_recovery_deadline: None,
         };
         // Device names are needed by the console's routing panel before Settings
         // is opened. This only enumerates; it never opens a stream or changes a
@@ -194,18 +198,28 @@ impl State {
     }
 
     fn choose_device(&mut self, input: bool, label: &str) {
-        let (current, choices) = if input {
-            (&mut self.draft.input_device, &self.input_choices)
+        let (current, label_field, choices) = if input {
+            (
+                &mut self.draft.input_device,
+                &mut self.draft.input_device_label,
+                &self.input_choices,
+            )
         } else {
-            (&mut self.draft.output_device, &self.output_choices)
+            (
+                &mut self.draft.output_device,
+                &mut self.draft.output_device_label,
+                &self.output_choices,
+            )
         };
         if input && label == "System default" {
             current.clear();
+            label_field.clear();
         } else if let Some(index) = device_labels(choices)
             .iter()
             .position(|candidate| candidate == label)
         {
             *current = choices[index].id.clone();
+            *label_field = choices[index].label.clone();
         }
         self.open_select = None;
     }
@@ -465,6 +479,8 @@ impl State {
             supervisor: Supervisor::new(),
             last_pops: 0,
             last_pop_change: Instant::now(),
+            device_recovering: false,
+            device_recovery_deadline: None,
         }
     }
 }
@@ -531,24 +547,25 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
     // Device-loss detection: playback error callback, missing output device, or a
     // short queue stall. Any of these triggers recovery below.
     let mut device_lost = false;
-    if let Some(playback) = &s.playback {
-        if playback.health.has_error() {
-            device_lost = true;
-            status.device_errors += 1;
-            if let Some(msg) = playback.health.take_error() {
-                s.error = Some(format!("Audio output error: {msg}"));
-            }
+    if let Some(playback) = &s.playback
+        && playback.health.has_error()
+    {
+        device_lost = true;
+        status.device_errors += 1;
+        if let Some(msg) = playback.health.take_error() {
+            s.error = Some(format!("Audio output error: {msg}"));
         }
     }
-    if !device_lost && s.playback.is_some() {
-        let present = device_choices(false)
-            .map(|choices| choices.iter().any(|c| c.id == s.settings.output_device))
-            .unwrap_or(true);
-        if !present {
-            device_lost = true;
-            status.device_errors += 1;
-            s.error = Some("Audio output device is no longer available.".into());
-        }
+    if !device_lost
+        && s.playback.is_some()
+        && !dex_audio::output_device_present(
+            &s.settings.output_device,
+            &s.settings.output_device_label,
+        )
+    {
+        device_lost = true;
+        status.device_errors += 1;
+        s.error = Some("Audio output device is no longer available.".into());
     }
     if !device_lost
         && status.state == EngineState::Running
@@ -563,44 +580,12 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
         s.error = Some("Audio output stopped consuming queued audio.".into());
     }
 
-    if device_lost && s.playback.is_some() {
-        s.playback.take();
-        if let Some(queue) = s.queue.clone() {
-            let cleared = queue.clear();
-            status.queue_cleared_samples += cleared as u64;
-        }
-        let mut reopened = false;
-        if let Some(queue) = s.queue.clone() {
-            match start_playback(&s.settings.output_device, Arc::clone(&queue)) {
-                Ok(playback) => {
-                    s.playback = Some(playback);
-                    reopened = true;
-                }
-                Err(_) => {
-                    // Try by label/name among current devices.
-                    if let Ok(choices) = device_choices(false) {
-                        if let Some(choice) = choices
-                            .iter()
-                            .find(|c| c.id == s.settings.output_device || c.label == s.settings.output_device)
-                        {
-                            if let Ok(playback) = start_playback(&choice.id, Arc::clone(&queue)) {
-                                s.playback = Some(playback);
-                                s.settings.output_device = choice.id.clone();
-                                reopened = true;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if reopened {
-            s.supervisor.on_playback_recovered();
-            status.device_state = merge_device_state(status.device_state, s.supervisor.device);
-            status.device_recoveries = s.supervisor.device_recoveries() as u64;
-            s.last_pop_change = Instant::now();
-            s.last_pops = s.queue.as_ref().map(|q| q.pops()).unwrap_or(0);
-            s.error = None;
-        } else {
+    // Debounced one-shot recovery.
+    if device_lost {
+        if s.device_recovering {
+            // Second loss edge before healthy -> fail.
+            s.device_recovering = false;
+            s.device_recovery_deadline = None;
             s.supervisor.fail_device();
             status.device_state = DeviceState::Lost;
             status.failure_domain = FailureDomain::Device;
@@ -613,8 +598,104 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
             }
             s.stop_devices();
             s.closing = true;
+            changed = true;
+        } else {
+            // First loss edge: enter Recovering, clear queue, count, no unmute.
+            s.device_recovering = true;
+            s.device_recovery_deadline = Some(Instant::now() + Duration::from_secs(1));
+            if let Some(pb) = s.playback.take() {
+                drop(pb);
+            }
+            if let Some(queue) = s.queue.clone() {
+                let cleared = queue.clear();
+                status.queue_cleared_samples += cleared as u64;
+            }
+            status.device_errors += 1;
+            status.device_state = DeviceState::Recovering;
+            s.supervisor.on_playback_stall();
+            status.device_state = merge_device_state(status.device_state, s.supervisor.device);
+            status.state = EngineState::Recovering;
+            changed = true;
         }
-        changed = true;
+    }
+
+    // While recovering, probe presence and reopen exactly once.
+    if s.device_recovering {
+        let present = dex_audio::output_device_present(
+            &s.settings.output_device,
+            &s.settings.output_device_label,
+        );
+        let deadline = s.device_recovery_deadline.unwrap_or_else(Instant::now);
+        if present {
+            let mut reopened = false;
+            if let Some(queue) = s.queue.clone() {
+                match start_playback(&s.settings.output_device, Arc::clone(&queue)) {
+                    Ok(playback) => {
+                        s.playback = Some(playback);
+                        reopened = true;
+                    }
+                    Err(_) => {
+                        if !s.settings.output_device_label.trim().is_empty()
+                            && let Ok(choices) = device_choices(false)
+                            && let Some(choice) = choices.iter().find(|c| {
+                                c.label
+                                    .eq_ignore_ascii_case(&s.settings.output_device_label)
+                                    || c.id == s.settings.output_device
+                            })
+                            && let Ok(playback) = start_playback(&choice.id, Arc::clone(&queue))
+                        {
+                            s.playback = Some(playback);
+                            s.settings.output_device = choice.id.clone();
+                            s.settings.output_device_label = choice.label.clone();
+                            reopened = true;
+                        }
+                    }
+                }
+            }
+            if reopened {
+                s.device_recovering = false;
+                s.device_recovery_deadline = None;
+                s.supervisor.on_playback_recovered();
+                status.device_state = merge_device_state(status.device_state, s.supervisor.device);
+                status.device_recoveries = s.supervisor.device_recoveries() as u64;
+                s.last_pop_change = Instant::now();
+                s.last_pops = s.queue.as_ref().map(|q| q.pops()).unwrap_or(0);
+                status.state = EngineState::Running;
+                s.error = None;
+            } else {
+                s.device_recovering = false;
+                s.device_recovery_deadline = None;
+                s.supervisor.fail_device();
+                status.device_state = DeviceState::Lost;
+                status.failure_domain = FailureDomain::Device;
+                status.device_recovery_failures += 1;
+                status.state = EngineState::Failed;
+                status.error = Some("Audio output device lost and could not be recovered.".into());
+                s.error = status.error.clone();
+                if let Some(engine) = &s.engine {
+                    engine.request_stop();
+                }
+                s.stop_devices();
+                s.closing = true;
+            }
+            changed = true;
+        } else if Instant::now() >= deadline {
+            s.device_recovering = false;
+            s.device_recovery_deadline = None;
+            s.supervisor.fail_device();
+            status.device_state = DeviceState::Lost;
+            status.failure_domain = FailureDomain::Device;
+            status.device_recovery_failures += 1;
+            status.state = EngineState::Failed;
+            status.error = Some("Audio output device lost and could not be recovered.".into());
+            s.error = status.error.clone();
+            if let Some(engine) = &s.engine {
+                engine.request_stop();
+            }
+            s.stop_devices();
+            s.closing = true;
+            changed = true;
+        }
     }
 
     // A playback that stops consuming queued audio for two seconds is a device

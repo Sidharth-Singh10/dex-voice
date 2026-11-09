@@ -171,21 +171,41 @@ pub fn device_choices(input: bool) -> Result<Vec<DeviceChoice>> {
         host.output_devices().context("enumerate output devices")?
     };
     Ok(devices
-        .filter_map(|device| {
-            Some(DeviceChoice {
-                id: device.id().ok()?.to_string(),
-                label: device.to_string(),
-            })
+        .map(|device| {
+            let label = device.to_string();
+            let id = device
+                .id()
+                .ok()
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| label.clone());
+            DeviceChoice { id, label }
         })
         .collect())
 }
 
-pub fn output_devices() -> Result<Vec<String>> {
-    Ok(cpal::default_host()
-        .output_devices()
-        .context("enumerate output devices")?
-        .map(|device| device.to_string())
-        .collect())
+pub fn output_device_present(id: &str, label: &str) -> bool {
+    let host = cpal::default_host();
+    let devices: Vec<_> = match host.output_devices() {
+        Ok(d) => d.collect(),
+        Err(_) => return true,
+    };
+    if !id.trim().is_empty()
+        && devices
+            .iter()
+            .any(|d| d.id().is_ok_and(|x| x.to_string() == id))
+    {
+        return true;
+    }
+    if !label.trim().is_empty() {
+        let wanted = label.trim().to_lowercase();
+        if devices.iter().any(|d| {
+            let name = d.to_string();
+            name.eq_ignore_ascii_case(label) || name.to_lowercase().contains(&wanted)
+        }) {
+            return true;
+        }
+    }
+    id.trim().is_empty() && label.trim().is_empty()
 }
 
 /// The default output device's sample rate, so the engine can produce audio at
@@ -381,7 +401,10 @@ impl PlaybackHealth {
         self.error.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
     pub fn has_error(&self) -> bool {
-        self.error.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+        self.error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
     }
     pub fn set_error(&self, message: String) {
         *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
@@ -412,22 +435,90 @@ pub fn start_playback(device_name: &str, queue: Arc<PcmQueue>) -> Result<Playbac
     let stream_config = requested_config(config);
     let health = std::sync::Arc::new(PlaybackHealth::default());
     let stream = match format {
-        cpal::SampleFormat::F32 => output_stream::<f32>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
-        cpal::SampleFormat::F64 => output_stream::<f64>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
-        cpal::SampleFormat::I8 => output_stream::<i8>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
-        cpal::SampleFormat::I16 => output_stream::<i16>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
-        cpal::SampleFormat::I24 => {
-            output_stream::<cpal::I24>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?
-        }
-        cpal::SampleFormat::I32 => output_stream::<i32>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
-        cpal::SampleFormat::I64 => output_stream::<i64>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
-        cpal::SampleFormat::U8 => output_stream::<u8>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
-        cpal::SampleFormat::U16 => output_stream::<u16>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
-        cpal::SampleFormat::U24 => {
-            output_stream::<cpal::U24>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?
-        }
-        cpal::SampleFormat::U32 => output_stream::<u32>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
-        cpal::SampleFormat::U64 => output_stream::<u64>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
+        cpal::SampleFormat::F32 => output_stream::<f32>(
+            &device,
+            stream_config,
+            channels,
+            queue,
+            std::sync::Arc::clone(&health),
+        )?,
+        cpal::SampleFormat::F64 => output_stream::<f64>(
+            &device,
+            stream_config,
+            channels,
+            queue,
+            std::sync::Arc::clone(&health),
+        )?,
+        cpal::SampleFormat::I8 => output_stream::<i8>(
+            &device,
+            stream_config,
+            channels,
+            queue,
+            std::sync::Arc::clone(&health),
+        )?,
+        cpal::SampleFormat::I16 => output_stream::<i16>(
+            &device,
+            stream_config,
+            channels,
+            queue,
+            std::sync::Arc::clone(&health),
+        )?,
+        cpal::SampleFormat::I24 => output_stream::<cpal::I24>(
+            &device,
+            stream_config,
+            channels,
+            queue,
+            std::sync::Arc::clone(&health),
+        )?,
+        cpal::SampleFormat::I32 => output_stream::<i32>(
+            &device,
+            stream_config,
+            channels,
+            queue,
+            std::sync::Arc::clone(&health),
+        )?,
+        cpal::SampleFormat::I64 => output_stream::<i64>(
+            &device,
+            stream_config,
+            channels,
+            queue,
+            std::sync::Arc::clone(&health),
+        )?,
+        cpal::SampleFormat::U8 => output_stream::<u8>(
+            &device,
+            stream_config,
+            channels,
+            queue,
+            std::sync::Arc::clone(&health),
+        )?,
+        cpal::SampleFormat::U16 => output_stream::<u16>(
+            &device,
+            stream_config,
+            channels,
+            queue,
+            std::sync::Arc::clone(&health),
+        )?,
+        cpal::SampleFormat::U24 => output_stream::<cpal::U24>(
+            &device,
+            stream_config,
+            channels,
+            queue,
+            std::sync::Arc::clone(&health),
+        )?,
+        cpal::SampleFormat::U32 => output_stream::<u32>(
+            &device,
+            stream_config,
+            channels,
+            queue,
+            std::sync::Arc::clone(&health),
+        )?,
+        cpal::SampleFormat::U64 => output_stream::<u64>(
+            &device,
+            stream_config,
+            channels,
+            queue,
+            std::sync::Arc::clone(&health),
+        )?,
         other => return Err(anyhow!("unsupported output sample format {other:?}")),
     };
     stream.play().context("start playback")?;
