@@ -109,6 +109,8 @@ models and processes an embedded fixture without opening audio devices; it
 requires a working Vulkan GPU and reports recognized text, audible PCM, and
 queue drops in JSON. Missing model files are reported before starting.
 
+p50/p95 measure the time from the first non-empty recognition hypothesis for a phrase (committed or tentative) to the first sample pushed into the output queue. They include the phrase-boundary wait and synthesis time and exclude playback/device and acoustic latency. A phrase that produces no PCM records no sample.
+
 The Linux installer provides Default, Zoey and Juniper; other voices appear
 after installing compatible embeddings into the selected checkpoint's
 `voices/` or `embeddings/` directory. The Windows installer currently provides

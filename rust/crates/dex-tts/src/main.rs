@@ -59,7 +59,10 @@ fn main() -> Result<()> {
             let mut first = None;
             let mut samples = 0usize;
             let mut pcm = Vec::new();
-            for chunk in tts.stream(text).with_context(|| format!("stream {text:?}"))? {
+            for chunk in tts
+                .stream(text)
+                .with_context(|| format!("stream {text:?}"))?
+            {
                 let chunk = chunk.context("synthesis chunk")?;
                 if first.is_none() {
                     first = Some(start.elapsed().as_secs_f64() * 1000.0);

@@ -4,7 +4,7 @@
 //! recognizers and deterministic clocks; no model, GPU or microphone is involved.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::sync_channel;
+use std::sync::mpsc::{channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -105,34 +105,70 @@ fn synthesis_failure_is_reported_and_stops_recognition() {
     assert!(status.synthesis_stalls >= 1);
 }
 
-/// Sink that fails once then succeeds, exercising the one-shot TTS restart path.
-#[derive(Default)]
+/// Sink that fails once then succeeds, exercising the one-shot TTS restart
+/// path. Events are sent on a channel so the test can synchronise on a
+/// barrier instead of sleeping on wall-clock time.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeEvent {
+    Disconnected,
+    Restarted,
+    Sent(Vec<String>),
+}
+
 struct RestartOnceSink {
     calls: AtomicUsize,
     groups: Mutex<Vec<Vec<String>>>,
+    events: Mutex<std::sync::mpsc::Sender<ProbeEvent>>,
+}
+
+impl RestartOnceSink {
+    fn new() -> (Self, std::sync::mpsc::Receiver<ProbeEvent>) {
+        let (tx, rx) = channel();
+        (
+            Self {
+                calls: AtomicUsize::new(0),
+                groups: Mutex::new(Vec::new()),
+                events: Mutex::new(tx),
+            },
+            rx,
+        )
+    }
 }
 
 impl PhraseSink for RestartOnceSink {
     fn try_send(&self, dispatch: dex_core::Dispatch) -> SendOutcome {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         if n == 0 {
+            let _ = self.events.lock().unwrap().send(ProbeEvent::Disconnected);
             SendOutcome::Disconnected
         } else {
-            self.groups.lock().unwrap().push(dispatch.words);
+            let words = dispatch.words.clone();
+            self.groups.lock().unwrap().push(words.clone());
+            let _ = self.events.lock().unwrap().send(ProbeEvent::Sent(words));
             SendOutcome::Sent
         }
     }
     fn restart(&self) -> bool {
+        let _ = self.events.lock().unwrap().send(ProbeEvent::Restarted);
         true
     }
 }
 
 #[test]
 fn restart_succeeds_and_subsequent_phrase_speaks() {
+    // Deterministic, event-barrier driven: Disconnected -> restart -> the
+    // retried phrase succeeds, then the next phrase (again) succeeds.
+    // No sleep / wall-clock wait; AutoClock advances per loop iteration.
     let specs = vec![
-        spec("hello ", FinalizeOutcome::Final(ScriptedText::new("hello ", ""))),
+        spec(
+            "hello ",
+            FinalizeOutcome::Final(ScriptedText::new("hello ", "")),
+        ),
         ScriptedSpec::default(),
-        spec("again ", FinalizeOutcome::Final(ScriptedText::new("again ", ""))),
+        spec(
+            "again ",
+            FinalizeOutcome::Final(ScriptedText::new("again ", "")),
+        ),
     ];
     let (tx, rx) = sync_channel::<Vec<f32>>(4096);
     let mut recognizer = ScriptedRecognizer::new(specs);
@@ -140,7 +176,8 @@ fn restart_succeeds_and_subsequent_phrase_speaks() {
     let output = Arc::new(PcmQueue::new(4096));
     let inflight = InFlight::new();
     let status_thread = Arc::clone(&status);
-    let sink = Arc::new(RestartOnceSink::default());
+    let (sink, events) = RestartOnceSink::new();
+    let sink = Arc::new(sink);
     let sink_dyn: Arc<dyn PhraseSink + Send + Sync> = sink.clone();
     let handle = thread::spawn(move || {
         run_loop(
@@ -157,18 +194,49 @@ fn restart_succeeds_and_subsequent_phrase_speaks() {
         .unwrap();
     });
 
+    // Phrase 1: speech + 800 ms of silence endpoints at the audio-frame level.
     tx.send(vec![0.5; 320]).unwrap();
-    for _ in 0..80 {
-        let _ = tx.send(vec![0.0; 320]);
+    for _ in 0..60 {
+        tx.send(vec![0.0; 320]).unwrap();
     }
-    // Wait for first phrase dispatch + restart.
-    thread::sleep(Duration::from_millis(100));
+    // Barrier: Disconnected -> Restarted -> retried Sent(hello), in order.
+    assert_eq!(events.recv().unwrap(), ProbeEvent::Disconnected);
+    assert_eq!(events.recv().unwrap(), ProbeEvent::Restarted);
+    assert_eq!(
+        events.recv().unwrap(),
+        ProbeEvent::Sent(vec!["hello".to_owned()])
+    );
+    assert_eq!(
+        sink.groups.lock().unwrap().clone(),
+        vec![vec!["hello".to_owned()]]
+    );
+
+    // Phrase 2: 600 silent frames drive the empty middle stream to its
+    // unarmed cap (500) and then the "again" stream to its silence endpoint.
+    for _ in 0..600 {
+        tx.send(vec![0.0; 320]).unwrap();
+    }
+    assert_eq!(
+        events.recv().unwrap(),
+        ProbeEvent::Sent(vec!["again".to_owned()])
+    );
+
     drop(tx);
     handle.join().unwrap();
 
-    assert!(!sink.groups.lock().unwrap().is_empty());
-    assert!(status.lock().unwrap().tts_restarts >= 1);
-    assert_ne!(status.lock().unwrap().state, dex_core::State::Failed);
+    assert_eq!(
+        sink.groups.lock().unwrap().clone(),
+        vec![vec!["hello".to_owned()], vec!["again".to_owned()]]
+    );
+    assert_eq!(sink.calls.load(Ordering::SeqCst), 3);
+    assert!(events.try_recv().is_err(), "no further sink events");
+    let status = status.lock().unwrap();
+    assert_eq!(status.tts_restarts, 1, "exactly one restart");
+    assert_eq!(status.dispatch_failures, 1);
+    assert_eq!(status.tts_restart_failures, 0);
+    assert_eq!(status.synthesis_stalls, 0);
+    assert_ne!(status.state, dex_core::State::Failed);
+    assert_eq!(status.transcript, "hello again ");
 }
 
 #[test]
@@ -205,7 +273,11 @@ fn speech_error_marker_is_recorded_on_disconnect_failure() {
     handle.join().unwrap();
 
     let status = status.lock().unwrap();
-    assert!(status.transcript.contains("[not spoken: synthesis unavailable]"));
+    assert!(
+        status
+            .transcript
+            .contains("[not spoken: synthesis unavailable]")
+    );
     assert!(status.synthesis_stalls >= 1);
 }
 

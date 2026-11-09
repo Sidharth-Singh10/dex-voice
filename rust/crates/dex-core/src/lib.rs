@@ -1341,8 +1341,10 @@ fn tts_inner(
 }
 
 fn note_synthesis_error(status: &Arc<Mutex<Status>>, error: String) -> bool {
-    // Production synthesis-failure marker path (not a dispatch failure). Kept
-    // as a helper so the marker + counter + terminal transition are testable
+    // Production synthesis-failure marker path (not a dispatch failure).
+    // Called verbatim from `tts_inner` on `Err(error)` after synthesis:
+    // `if note_synthesis_error(status, format!("{error:#}"))`. Kept as a
+    // helper so the marker + counter + terminal transition are testable
     // hermetically without loading a Phonon model.
     bump(status, |s| s.synthesis_errors += 1);
     append_marker(status, "[speech error]");
@@ -1393,9 +1395,10 @@ fn update_output_status(
     at: Instant,
     first_pcm: Instant,
 ) {
-    // Approved metric: first committed word (`at`) -> first queued PCM.
-    // `first_pcm` is when the first sample was pushed into the output queue,
-    // not end-of-synthesis. `saturating_duration_since` keeps the helper total
+    // Approved metric: first hypothesis (`at`, first non-empty display,
+    // committed or tentative) -> first queued PCM (`first_pcm`). `first_pcm`
+    // is when the first sample was pushed into the output queue, not
+    // end-of-synthesis. `saturating_duration_since` keeps the helper total
     // even if a test clock and the push clock disagree.
     let delay = first_pcm.saturating_duration_since(at).as_secs_f64() * 1000.0;
     let mut status = status.lock().unwrap_or_else(|e| e.into_inner());
@@ -1661,15 +1664,23 @@ mod tests {
 
     #[test]
     fn metric_delay_is_first_pcm_not_end_of_synthesis() {
-        // Deterministic: t0 = first committed word, t1 = first PCM push,
-        // t2 = later end-of-synthesis. Expected sample is t1 - t0; t2 excluded.
+        // Deterministic fake-clock timeline (ManualClock):
+        // t0 = first hypothesis (tentative display), t1 = first committed
+        // later, t2 = first PCM push, t3 = later end-of-synthesis.
+        // Expected sample is t2 - t0; t1 (committed) and t3 (end) excluded.
+        let clock = ManualClock::new();
+        let t0 = clock.now();
+        clock.advance(100);
+        let t1 = clock.now();
+        clock.advance(150);
+        let t2 = clock.now();
+        clock.advance(4750);
+        let t3 = clock.now();
+        // Sanity: t1-t0=100, t2-t1=150, t3-t0=5000.
         let status = Arc::new(Mutex::new(Status::default()));
         let output = PcmQueue::new(16);
         output.push(&[0.1; 4]);
-        let t0 = Instant::now();
-        let t1 = t0 + Duration::from_millis(250);
-        let t2 = t0 + Duration::from_millis(5000);
-        update_output_status(&status, &output, 16_000, t0, t1);
+        update_output_status(&status, &output, 16_000, t0, t2);
         {
             let s = status.lock().unwrap();
             assert_eq!(s.group_delays.len(), 1);
@@ -1678,12 +1689,18 @@ mod tests {
                 "{}",
                 s.group_delays[0]
             );
-            assert!(s.group_delays[0] < t2.duration_since(t0).as_secs_f64() * 1000.0 / 2.0);
+            // Not t2-t1 (150) and not t3-t0 (5000).
+            assert!(
+                (s.group_delays[0] - 150.0).abs() > 1.0,
+                "{}",
+                s.group_delays[0]
+            );
+            assert!(s.group_delays[0] < t3.duration_since(t0).as_secs_f64() * 1000.0 / 2.0);
+            // t1 is a real later instant that must not have been used as start.
+            assert!(t1.saturating_duration_since(t0).as_millis() == 100);
         }
-        // End-of-synthesis arriving later must not change the sample: calling
-        // again with the same t0/t1 after a delay still yields 250 ms.
-        thread::sleep(Duration::from_millis(20));
-        update_output_status(&status, &output, 16_000, t0, t1);
+        // End-of-synthesis is not an input: same t0/t2 always yields 250 ms.
+        update_output_status(&status, &output, 16_000, t0, t2);
         let s = status.lock().unwrap();
         assert_eq!(s.group_delays.len(), 2);
         assert!(
@@ -1694,13 +1711,38 @@ mod tests {
     }
 
     #[test]
+    fn metric_no_sample_when_phrase_produces_no_pcm() {
+        // A phrase with no PCM records no sample: production only calls
+        // update_output_status when first_pcm is Some (tts_inner guards with
+        // `if let Some(first_pcm)`), so the failure / no-PM path must leave
+        // group_delays empty and p50/p95 None.
+        let status = Arc::new(Mutex::new(Status {
+            transcript: "hello ".into(),
+            words: 1,
+            ..Status::default()
+        }));
+        assert!(status.lock().unwrap().group_delays.is_empty());
+        assert_eq!(status.lock().unwrap().p50_ms, None);
+        // Production no-PCM failure path (same handler as tts_inner error
+        // branch) must not add a sample; the failed phrase is counted in
+        // synthesis_errors instead.
+        assert!(!note_synthesis_error(&status, "no pcm".into()));
+        let s = status.lock().unwrap();
+        assert!(s.group_delays.is_empty());
+        assert_eq!(s.p50_ms, None);
+        assert_eq!(s.p95_ms, None);
+        assert_eq!(s.synthesis_errors, 1);
+    }
+
+    #[test]
     fn metric_p95_is_the_95th_percentile_of_first_pcm_delays() {
+        let clock = ManualClock::new();
+        let t0 = clock.now();
         let status = Arc::new(Mutex::new(Status::default()));
         let output = PcmQueue::new(16);
         output.push(&[0.1; 4]);
-        let t0 = Instant::now();
-        // 101 samples: 0, 10, ..., 1000 ms. p50 index 50 -> 500 ms,
-        // p95 index 95 -> 950 ms.
+        // 101 samples: t0->PCM delays 0, 10, ..., 1000 ms (hypothesis to
+        // first pushed sample). p50 index 50 -> 500 ms, p95 index 95 -> 950 ms.
         for i in 0..101_u64 {
             update_output_status(
                 &status,
@@ -1841,8 +1883,12 @@ mod tests {
 
     #[test]
     fn speech_error_marker_counts_and_fails_after_limit() {
-        // Production synthesis-failure path (tts_inner error branch), not a
-        // dispatch disconnect. No PCM pushed -> no metric sample; the failed
+        // Production synthesis-failure path, not a dispatch disconnect.
+        // `tts_inner` error branch invokes this same handler verbatim:
+        // `if note_synthesis_error(status, format!("{error:#}"))` in
+        // `tts_inner` (`Err(error)` after synthesis). Calling it here drives
+        // the production marker + counter + LIMIT transition without loading
+        // a Phonon model. No PCM pushed -> no metric sample; the failed
         // phrase is counted in synthesis_errors and marked [speech error].
         let status = Arc::new(Mutex::new(Status {
             transcript: "hello ".into(),

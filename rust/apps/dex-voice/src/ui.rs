@@ -732,7 +732,7 @@ fn signal_bar(s: &State, k: &Kit) -> El {
         .label("Signal")
         .child(text("Signal").font(label_style()).color(k.c.text_muted))
         .child(
-            text("p50/p95: first committed word → first queued PCM (includes the phrase wait and synthesis; not playback or acoustic end-to-end latency).")
+            text("p50/p95: first hypothesis (committed or tentative) → first queued PCM (includes the phrase wait and synthesis; not playback or acoustic end-to-end latency).")
                 .font(faint_style())
                 .color(k.c.text_muted)
                 .wrap()
@@ -1480,9 +1480,11 @@ mod tests {
         state.status.p95_ms = Some(684.0);
         let rt = runtime(state, (900.0, 640.0));
         let text = body_text(&rt);
-        // Exact approved wording (code now measures first queued PCM, not end
-        // of synthesis). Old "(incl. synthesis)" label must be gone.
-        assert!(text.contains("p50/p95: first committed word → first queued PCM (includes the phrase wait and synthesis; not playback or acoustic end-to-end latency)."));
+        // Exact approved wording: first hypothesis (committed or tentative)
+        // to first queued PCM (code measures first push, not end of
+        // synthesis). Old "first committed word" / "(incl. synthesis)" must be gone.
+        assert!(text.contains("p50/p95: first hypothesis (committed or tentative) → first queued PCM (includes the phrase wait and synthesis; not playback or acoustic end-to-end latency)."));
+        assert!(!text.contains("first committed word"));
         assert!(!text.contains("(incl. synthesis)"));
         assert!(text.contains("95th percentile"));
         assert!(!text.contains("slowest 5%"));
