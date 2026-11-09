@@ -3,7 +3,7 @@
 //! These exercise the production `run_loop`/`Engine` entry points with scripted
 //! recognizers and deterministic clocks; no model, GPU or microphone is involved.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -102,6 +102,110 @@ fn synthesis_failure_is_reported_and_stops_recognition() {
     let status = status.lock().unwrap();
     assert_eq!(status.state, dex_core::State::Failed);
     assert_eq!(status.failure_domain, dex_core::FailureDomain::Synthesis);
+    assert!(status.synthesis_stalls >= 1);
+}
+
+/// Sink that fails once then succeeds, exercising the one-shot TTS restart path.
+#[derive(Default)]
+struct RestartOnceSink {
+    calls: AtomicUsize,
+    groups: Mutex<Vec<Vec<String>>>,
+}
+
+impl PhraseSink for RestartOnceSink {
+    fn try_send(&self, dispatch: dex_core::Dispatch) -> SendOutcome {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            SendOutcome::Disconnected
+        } else {
+            self.groups.lock().unwrap().push(dispatch.words);
+            SendOutcome::Sent
+        }
+    }
+    fn restart(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn restart_succeeds_and_subsequent_phrase_speaks() {
+    let specs = vec![
+        spec("hello ", FinalizeOutcome::Final(ScriptedText::new("hello ", ""))),
+        ScriptedSpec::default(),
+        spec("again ", FinalizeOutcome::Final(ScriptedText::new("again ", ""))),
+    ];
+    let (tx, rx) = sync_channel::<Vec<f32>>(4096);
+    let mut recognizer = ScriptedRecognizer::new(specs);
+    let status = Arc::new(Mutex::new(Status::default()));
+    let output = Arc::new(PcmQueue::new(4096));
+    let inflight = InFlight::new();
+    let status_thread = Arc::clone(&status);
+    let sink = Arc::new(RestartOnceSink::default());
+    let sink_dyn: Arc<dyn PhraseSink + Send + Sync> = sink.clone();
+    let handle = thread::spawn(move || {
+        run_loop(
+            rx,
+            &mut recognizer,
+            sink_dyn.as_ref(),
+            &status_thread,
+            &output,
+            &AutoClock::new(),
+            &inflight,
+            EndpointConfig::default(),
+            None,
+        )
+        .unwrap();
+    });
+
+    tx.send(vec![0.5; 320]).unwrap();
+    for _ in 0..80 {
+        let _ = tx.send(vec![0.0; 320]);
+    }
+    // Wait for first phrase dispatch + restart.
+    thread::sleep(Duration::from_millis(100));
+    drop(tx);
+    handle.join().unwrap();
+
+    assert!(sink.groups.lock().unwrap().len() >= 1);
+    assert!(status.lock().unwrap().tts_restarts >= 1);
+    assert_ne!(status.lock().unwrap().state, dex_core::State::Failed);
+}
+
+#[test]
+fn speech_error_marker_is_recorded_on_disconnect_failure() {
+    let specs = vec![spec("hello ", FinalizeOutcome::Error)];
+    let (tx, rx) = sync_channel::<Vec<f32>>(4096);
+    let mut recognizer = ScriptedRecognizer::new(specs);
+    let status = Arc::new(Mutex::new(Status::default()));
+    let output = Arc::new(PcmQueue::new(4096));
+    let inflight = InFlight::new();
+    let status_thread = Arc::clone(&status);
+    let sink = Arc::new(DisconnectedSink);
+    let sink_dyn: Arc<dyn PhraseSink + Send + Sync> = sink;
+    let handle = thread::spawn(move || {
+        run_loop(
+            rx,
+            &mut recognizer,
+            sink_dyn.as_ref(),
+            &status_thread,
+            &output,
+            &AutoClock::new(),
+            &inflight,
+            EndpointConfig::default(),
+            None,
+        )
+        .unwrap();
+    });
+
+    tx.send(vec![0.5; 320]).unwrap();
+    for _ in 0..60 {
+        let _ = tx.send(vec![0.0; 320]);
+    }
+    drop(tx);
+    handle.join().unwrap();
+
+    let status = status.lock().unwrap();
+    assert!(status.transcript.contains("[not spoken: synthesis unavailable]"));
     assert!(status.synthesis_stalls >= 1);
 }
 

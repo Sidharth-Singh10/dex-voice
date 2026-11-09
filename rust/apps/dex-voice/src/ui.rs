@@ -1497,11 +1497,13 @@ mod tests {
     fn mic_drops_include_capture_loss() {
         let mut state = State::test_fixture();
         state.status.state = EngineState::Running;
-        state.status.input_drops = 2;
-        state.status.capture_drops = 3;
+        state.status.input_drops = 7;
+        state.status.capture_drops = 11;
         let rt = runtime(state, (900.0, 640.0));
         let text = body_text(&rt);
-        assert!(text.contains("5"));
+        assert!(text.contains("Mic drops"));
+        assert!(text.contains("input+capture"));
+        assert!(text.contains("18"));
     }
 
     #[test]

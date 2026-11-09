@@ -1637,4 +1637,17 @@ mod tests {
         assert_eq!(orphan_loader_exits(), before + 1);
         assert!(!generation_retired_pending());
     }
+
+    #[test]
+    fn metric_delay_is_computed_from_at() {
+        let status = Arc::new(Mutex::new(Status::default()));
+        let output = PcmQueue::new(16);
+        output.push(&[0.1; 4]);
+        let at = Instant::now();
+        update_output_status(&status, &output, 16_000, at);
+        let s = status.lock().unwrap();
+        assert!(s.p50_ms.is_some());
+        assert!(s.p95_ms.is_some());
+        assert_eq!(s.group_delays.len(), 1);
+    }
 }
