@@ -632,10 +632,13 @@ pub fn output_device_ready(id: &str, label: &str) -> bool {
     let device = device.or_else(|| {
         if !label.trim().is_empty() {
             let wanted = label.trim().to_lowercase();
-            devices.iter().find(|d| {
-                let name = d.to_string();
-                name.eq_ignore_ascii_case(label) || name.to_lowercase().contains(&wanted)
-            }).cloned()
+            devices
+                .iter()
+                .find(|d| {
+                    let name = d.to_string();
+                    name.eq_ignore_ascii_case(label) || name.to_lowercase().contains(&wanted)
+                })
+                .cloned()
         } else {
             None
         }

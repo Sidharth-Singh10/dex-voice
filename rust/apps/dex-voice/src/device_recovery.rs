@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! clock and a presence/readiness probe supplied by the caller.
 
 use std::time::{Duration, Instant};
@@ -147,7 +146,10 @@ mod tests {
         p.reopen_result(true);
         assert_eq!(p.state, RecoveryState::Healthy);
         // second tick no reopen
-        assert_eq!(p.tick(deadline + Duration::from_millis(10), true), RecoveryAction::None);
+        assert_eq!(
+            p.tick(deadline + Duration::from_millis(10), true),
+            RecoveryAction::None
+        );
     }
 
     #[test]
@@ -170,7 +172,10 @@ mod tests {
         assert_eq!(p.tick(deadline, false), RecoveryAction::Fail);
         assert_eq!(p.state, RecoveryState::Failed);
         // no further attempts
-        assert_eq!(p.tick(deadline + Duration::from_secs(1), true), RecoveryAction::None);
+        assert_eq!(
+            p.tick(deadline + Duration::from_secs(1), true),
+            RecoveryAction::None
+        );
     }
 
     #[test]
