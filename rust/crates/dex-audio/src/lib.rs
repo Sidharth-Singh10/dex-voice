@@ -276,6 +276,7 @@ fn output_stream<T>(
     config: cpal::StreamConfig,
     channels: usize,
     queue: Arc<PcmQueue>,
+    health: std::sync::Arc<PlaybackHealth>,
 ) -> Result<cpal::Stream>
 where
     T: cpal::SizedSample + Copy + Send + 'static,
@@ -292,7 +293,13 @@ where
                     frame.fill(T::from_sample_(sample));
                 }
             },
-            |error| eprintln!("playback stream error: {error}"),
+            {
+                let health = std::sync::Arc::clone(&health);
+                move |error| {
+                    eprintln!("playback stream error: {error}");
+                    health.set_error(error.to_string());
+                }
+            },
             None,
         )
         .context("build playback stream")
@@ -362,11 +369,31 @@ pub fn start_capture(
     })
 }
 
+/// Shared health state for a playback stream. The stream's error callback
+/// records a failure here so the app can observe it without joining.
+#[derive(Default)]
+pub struct PlaybackHealth {
+    pub error: std::sync::Mutex<Option<String>>,
+}
+
+impl PlaybackHealth {
+    pub fn take_error(&self) -> Option<String> {
+        self.error.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+    pub fn has_error(&self) -> bool {
+        self.error.lock().unwrap_or_else(|e| e.into_inner()).is_some()
+    }
+    pub fn set_error(&self, message: String) {
+        *self.error.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
+    }
+}
+
 /// Keeps a playback stream alive. Drop stops it.
 pub struct Playback {
     _stream: cpal::Stream,
     pub sample_rate: u32,
     pub channels: u16,
+    pub health: std::sync::Arc<PlaybackHealth>,
 }
 
 pub fn start_playback(device_name: &str, queue: Arc<PcmQueue>) -> Result<Playback> {
@@ -383,23 +410,24 @@ pub fn start_playback(device_name: &str, queue: Arc<PcmQueue>) -> Result<Playbac
     );
     let format = config.sample_format();
     let stream_config = requested_config(config);
+    let health = std::sync::Arc::new(PlaybackHealth::default());
     let stream = match format {
-        cpal::SampleFormat::F32 => output_stream::<f32>(&device, stream_config, channels, queue)?,
-        cpal::SampleFormat::F64 => output_stream::<f64>(&device, stream_config, channels, queue)?,
-        cpal::SampleFormat::I8 => output_stream::<i8>(&device, stream_config, channels, queue)?,
-        cpal::SampleFormat::I16 => output_stream::<i16>(&device, stream_config, channels, queue)?,
+        cpal::SampleFormat::F32 => output_stream::<f32>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
+        cpal::SampleFormat::F64 => output_stream::<f64>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
+        cpal::SampleFormat::I8 => output_stream::<i8>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
+        cpal::SampleFormat::I16 => output_stream::<i16>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
         cpal::SampleFormat::I24 => {
-            output_stream::<cpal::I24>(&device, stream_config, channels, queue)?
+            output_stream::<cpal::I24>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?
         }
-        cpal::SampleFormat::I32 => output_stream::<i32>(&device, stream_config, channels, queue)?,
-        cpal::SampleFormat::I64 => output_stream::<i64>(&device, stream_config, channels, queue)?,
-        cpal::SampleFormat::U8 => output_stream::<u8>(&device, stream_config, channels, queue)?,
-        cpal::SampleFormat::U16 => output_stream::<u16>(&device, stream_config, channels, queue)?,
+        cpal::SampleFormat::I32 => output_stream::<i32>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
+        cpal::SampleFormat::I64 => output_stream::<i64>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
+        cpal::SampleFormat::U8 => output_stream::<u8>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
+        cpal::SampleFormat::U16 => output_stream::<u16>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
         cpal::SampleFormat::U24 => {
-            output_stream::<cpal::U24>(&device, stream_config, channels, queue)?
+            output_stream::<cpal::U24>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?
         }
-        cpal::SampleFormat::U32 => output_stream::<u32>(&device, stream_config, channels, queue)?,
-        cpal::SampleFormat::U64 => output_stream::<u64>(&device, stream_config, channels, queue)?,
+        cpal::SampleFormat::U32 => output_stream::<u32>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
+        cpal::SampleFormat::U64 => output_stream::<u64>(&device, stream_config, channels, queue, std::sync::Arc::clone(&health))?,
         other => return Err(anyhow!("unsupported output sample format {other:?}")),
     };
     stream.play().context("start playback")?;
@@ -407,6 +435,7 @@ pub fn start_playback(device_name: &str, queue: Arc<PcmQueue>) -> Result<Playbac
         _stream: stream,
         sample_rate,
         channels: config.channels(),
+        health,
     })
 }
 

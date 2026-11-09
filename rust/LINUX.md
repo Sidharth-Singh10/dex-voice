@@ -95,3 +95,11 @@ takes priority over minimizing the output queue.
 - **Failed-attached.** While failed, the engine stays attached and Start is
   refused until Stop releases it; the failure domain (synthesis vs. device) and
   the terminal state are preserved.
+
+- **Device recovery.** Playback errors, a missing output device, or a queue that
+  stops draining for ~500 ms are treated as device loss: the app drops the old
+  playback, clears and counts the queue, and reopens the device once (by ID,
+  then by label/name). A second loss or a failed reopen marks the device failed
+  and stops the engine; synthesis/ASR are not restarted. A recreated device with
+  a different ID is resolved by label, otherwise the run ends in a documented
+  Failed state.

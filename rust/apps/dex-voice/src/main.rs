@@ -528,6 +528,95 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
     let previous = s.status.clone();
     let mut changed = changed || status != s.status;
 
+    // Device-loss detection: playback error callback, missing output device, or a
+    // short queue stall. Any of these triggers recovery below.
+    let mut device_lost = false;
+    if let Some(playback) = &s.playback {
+        if playback.health.has_error() {
+            device_lost = true;
+            status.device_errors += 1;
+            if let Some(msg) = playback.health.take_error() {
+                s.error = Some(format!("Audio output error: {msg}"));
+            }
+        }
+    }
+    if !device_lost && s.playback.is_some() {
+        let present = device_choices(false)
+            .map(|choices| choices.iter().any(|c| c.id == s.settings.output_device))
+            .unwrap_or(true);
+        if !present {
+            device_lost = true;
+            status.device_errors += 1;
+            s.error = Some("Audio output device is no longer available.".into());
+        }
+    }
+    if !device_lost
+        && status.state == EngineState::Running
+        && s.capture.is_some()
+        && let Some(queue) = s.queue.clone()
+        && !queue.is_empty()
+        && s.last_pop_change.elapsed() > Duration::from_millis(500)
+        && queue.pops() == s.last_pops
+    {
+        device_lost = true;
+        status.device_errors += 1;
+        s.error = Some("Audio output stopped consuming queued audio.".into());
+    }
+
+    if device_lost && s.playback.is_some() {
+        s.playback.take();
+        if let Some(queue) = s.queue.clone() {
+            let cleared = queue.clear();
+            status.queue_cleared_samples += cleared as u64;
+        }
+        let mut reopened = false;
+        if let Some(queue) = s.queue.clone() {
+            match start_playback(&s.settings.output_device, Arc::clone(&queue)) {
+                Ok(playback) => {
+                    s.playback = Some(playback);
+                    reopened = true;
+                }
+                Err(_) => {
+                    // Try by label/name among current devices.
+                    if let Ok(choices) = device_choices(false) {
+                        if let Some(choice) = choices
+                            .iter()
+                            .find(|c| c.id == s.settings.output_device || c.label == s.settings.output_device)
+                        {
+                            if let Ok(playback) = start_playback(&choice.id, Arc::clone(&queue)) {
+                                s.playback = Some(playback);
+                                s.settings.output_device = choice.id.clone();
+                                reopened = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if reopened {
+            s.supervisor.on_playback_recovered();
+            status.device_state = merge_device_state(status.device_state, s.supervisor.device);
+            status.device_recoveries = s.supervisor.device_recoveries() as u64;
+            s.last_pop_change = Instant::now();
+            s.last_pops = s.queue.as_ref().map(|q| q.pops()).unwrap_or(0);
+            s.error = None;
+        } else {
+            s.supervisor.fail_device();
+            status.device_state = DeviceState::Lost;
+            status.failure_domain = FailureDomain::Device;
+            status.device_recovery_failures += 1;
+            status.state = EngineState::Failed;
+            status.error = Some("Audio output device lost and could not be recovered.".into());
+            s.error = status.error.clone();
+            if let Some(engine) = &s.engine {
+                engine.request_stop();
+            }
+            s.stop_devices();
+            s.closing = true;
+        }
+        changed = true;
+    }
+
     // A playback that stops consuming queued audio for two seconds is a device
     // stall, not a synthesis failure. Reopen exactly once, then fail the device
     // domain.

@@ -148,6 +148,7 @@ pub struct Status {
     pub cancel_timeouts: u64,
     pub device_recoveries: u64,
     pub device_recovery_failures: u64,
+    pub device_errors: u64,
     pub queue_cleared_samples: u64,
     pub stop_tail_dropped: u64,
     pub shutdown_incomplete_timeouts: u64,
