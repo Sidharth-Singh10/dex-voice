@@ -1,6 +1,7 @@
-import { ArrowUp, ArrowUpRight } from "@phosphor-icons/react/dist/ssr";
+import { ArrowUp, ArrowUpRight, GithubLogo } from "@phosphor-icons/react/dist/ssr";
 import { BrandMark } from "@/components/BrandMark";
 import { navLinks } from "@/lib/content";
+import { repoLabel, repoUrl } from "@/lib/site";
 
 const waveform = [
   16, 28, 42, 22, 54, 34, 70, 44, 26, 62, 38, 88, 52, 30, 74, 46, 24, 58, 34, 82, 48, 28, 66,
@@ -95,6 +96,15 @@ export function FooterCta() {
               >
                 Status
               </a>
+              <a
+                href={repoUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 text-[0.85rem] text-muted transition-colors hover:text-bone"
+              >
+                GitHub
+                <ArrowUpRight size={12} weight="bold" aria-hidden="true" />
+              </a>
             </nav>
 
             <div className="lg:text-right">
@@ -104,6 +114,15 @@ export function FooterCta() {
               <p className="mt-2 font-mono text-[9px] uppercase tracking-[0.08em] text-faint">
                 No public build / no account
               </p>
+              <a
+                href={repoUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="mt-3 inline-flex items-center gap-2 font-mono text-[10px] tracking-[0.02em] text-muted transition-colors hover:text-bone"
+              >
+                <GithubLogo size={13} weight="bold" aria-hidden="true" />
+                {repoLabel}
+              </a>
             </div>
           </div>
 

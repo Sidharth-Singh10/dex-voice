@@ -1,3 +1,5 @@
+import { repoUrl } from "@/lib/site";
+
 export const navLinks = [
   { href: "#pipeline", label: "Signal path" },
   { href: "#voices", label: "Voices" },
@@ -212,6 +214,7 @@ export type SetupStep = {
   title: string;
   detail: string;
   command: string | null;
+  link?: { href: string; label: string };
 };
 
 export const setupSteps: SetupStep[] = [
@@ -219,8 +222,9 @@ export const setupSteps: SetupStep[] = [
     id: "enter",
     title: "Enter the Rust workspace",
     detail:
-      "Start from a local checkout of the repository. This page does not link to a public clone URL or release package.",
+      "Start from a public checkout of the repository on GitHub. There is still no release package or installer.",
     command: "cd rust",
+    link: { href: repoUrl, label: "Open the repository on GitHub" },
   },
   {
     id: "models",

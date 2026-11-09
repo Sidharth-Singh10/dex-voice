@@ -1,4 +1,4 @@
-import { Check, Info, TerminalWindow } from "@phosphor-icons/react/dist/ssr";
+import { ArrowUpRight, Check, Info, TerminalWindow } from "@phosphor-icons/react/dist/ssr";
 import { CopyButton } from "@/components/CopyButton";
 import {
   prerequisites,
@@ -6,6 +6,7 @@ import {
   shutdownCleanup,
   troubleshootingCommands,
 } from "@/lib/content";
+import { repoFile, repoUrl } from "@/lib/site";
 
 export function SetupSection() {
   return (
@@ -20,7 +21,16 @@ export function SetupSection() {
           </h2>
           <p className="mt-6 max-w-[58ch] text-[1rem] leading-[1.65] text-muted md:text-[1.08rem]">
             This page is a showcase, not a download page. There is no public build or installer.
-            Start from a local checkout of the repository and follow the route below.
+            Start from the{" "}
+            <a
+              href={repoUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-bone underline decoration-line-strong underline-offset-4 transition-colors hover:text-accent"
+            >
+              public repository on GitHub
+            </a>{" "}
+            and follow the route below.
           </p>
         </div>
 
@@ -49,9 +59,36 @@ export function SetupSection() {
               <div className="mt-5 border-t border-line pt-4">
                 <p className="text-[0.8rem] leading-[1.55] text-faint">
                   Full build flags, vendored Vulkan headers, and distro notes live in{" "}
-                  <span className="font-mono text-[0.75rem] text-muted">rust/README.md</span>. The
-                  route is documented in{" "}
-                  <span className="font-mono text-[0.75rem] text-muted">rust/LINUX.md</span>.
+                  <a
+                    href={repoFile("rust/README.md")}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-mono text-[0.75rem] text-muted underline decoration-line underline-offset-2 transition-colors hover:text-bone"
+                  >
+                    rust/README.md
+                  </a>
+                  . The route is documented in{" "}
+                  <a
+                    href={repoFile("rust/LINUX.md")}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="font-mono text-[0.75rem] text-muted underline decoration-line underline-offset-2 transition-colors hover:text-bone"
+                  >
+                    rust/LINUX.md
+                  </a>
+                  .
+                </p>
+                <p className="mt-2 text-[0.8rem] leading-[1.55] text-faint">
+                  The source and{" "}
+                  <a
+                    href={`${repoUrl}/issues`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-muted underline decoration-line underline-offset-2 transition-colors hover:text-bone"
+                  >
+                    issues
+                  </a>{" "}
+                  live on GitHub.
                 </p>
               </div>
             </div>
@@ -84,6 +121,18 @@ export function SetupSection() {
                       <p className="mt-2 max-w-[56ch] text-[0.86rem] leading-[1.6] text-muted">
                         {step.detail}
                       </p>
+
+                      {step.link ? (
+                        <a
+                          href={step.link.href}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="mt-3 inline-flex items-center gap-1.5 text-[0.84rem] font-medium text-accent transition-colors hover:text-bone"
+                        >
+                          {step.link.label}
+                          <ArrowUpRight size={13} weight="bold" aria-hidden="true" />
+                        </a>
+                      ) : null}
 
                       {step.command ? (
                         <div className="mt-4 overflow-hidden rounded-lg border border-line bg-ink-deep">

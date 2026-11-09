@@ -3,7 +3,8 @@
 import { useRef } from "react";
 import { useGSAP } from "@gsap/react";
 import gsap from "gsap";
-import { ArrowDown, ArrowUpRight } from "@phosphor-icons/react";
+import { ArrowDown, ArrowUpRight, GithubLogo } from "@phosphor-icons/react";
+import { repoUrl } from "@/lib/site";
 import { SignalSchematic } from "@/components/SignalSchematic";
 
 export function Hero() {
@@ -90,6 +91,16 @@ export function Hero() {
                 <ArrowDown size={16} weight="bold" aria-hidden="true" />
               </a>
             </div>
+
+            <a
+              href={repoUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="hero-copy-item mt-6 inline-flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.12em] text-faint transition-colors hover:text-bone"
+            >
+              <GithubLogo size={14} weight="bold" aria-hidden="true" />
+              View source on GitHub
+            </a>
           </div>
 
           <div className="hero-panel relative z-10 lg:-mr-3 lg:translate-y-7 xl:-mr-8">

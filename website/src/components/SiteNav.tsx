@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ArrowUpRight, List, X } from "@phosphor-icons/react";
+import { ArrowUpRight, GithubLogo, List, X } from "@phosphor-icons/react";
 import { navLinks } from "@/lib/content";
+import { repoUrl } from "@/lib/site";
 import { BrandMark } from "@/components/BrandMark";
 
 export function SiteNav() {
@@ -60,6 +61,15 @@ export function SiteNav() {
           </nav>
 
           <div className="flex items-center gap-2">
+            <a
+              href={repoUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              aria-label="View source on GitHub"
+              className="hidden h-9 w-9 items-center justify-center rounded-lg border border-line text-muted transition-colors hover:bg-bone/5 hover:text-bone sm:flex"
+            >
+              <GithubLogo size={17} weight="bold" aria-hidden="true" />
+            </a>
             <span className="hidden items-center gap-2 rounded-full border border-line px-3 py-1.5 font-mono text-[9px] uppercase tracking-[0.12em] text-muted xl:inline-flex">
               <span className="soft-pulse h-1.5 w-1.5 rounded-full bg-accent" aria-hidden="true" />
               Experimental build
@@ -103,6 +113,19 @@ export function SiteNav() {
                   {link.label}
                 </a>
               ))}
+              <a
+                href={repoUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={() => setOpen(false)}
+                className="mt-2 flex items-center justify-between rounded-lg border border-line px-3 py-3 text-base font-medium text-bone transition-colors hover:bg-bone/5"
+              >
+                <span className="flex items-center gap-2">
+                  <GithubLogo size={17} weight="bold" aria-hidden="true" />
+                  View source on GitHub
+                </span>
+                <ArrowUpRight size={16} weight="bold" aria-hidden="true" />
+              </a>
               <a
                 href="#setup"
                 onClick={() => setOpen(false)}

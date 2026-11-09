@@ -10,6 +10,7 @@ import {
   shutdownCleanup,
   troubleshootingCommands,
 } from "@/lib/content";
+import { repoFile, repoUrl } from "@/lib/site";
 
 describe("showcase content", () => {
   it("keeps the documented four-stage signal path", () => {
@@ -112,7 +113,7 @@ describe("showcase content", () => {
     expect(commands).toContain("./target/release/dex-voice");
   });
 
-  it("does not invent an external download or repository URL", () => {
+  it("links only the project repository and no download URL", () => {
     const content = JSON.stringify({
       behaviorText,
       blockedItems,
@@ -120,7 +121,20 @@ describe("showcase content", () => {
       setupSteps,
       troubleshootingCommands,
     });
-    expect(content).not.toMatch(/https?:\/\//);
-    expect(content).not.toMatch(/github\.com/i);
+    const urls = [...content.matchAll(/https?:\/\/[^"\\\s]+/g)].map((match) => match[0]);
+
+    expect(urls.length).toBeGreaterThan(0);
+    for (const url of urls) {
+      expect(url.startsWith(repoUrl)).toBe(true);
+    }
+    expect(content).not.toMatch(/\/(releases|download|installer)/i);
+    expect(content).not.toMatch(/github\.com\/(?!Sidharth-Singh10\/dex-voice)/i);
+  });
+
+  it("builds repository file links on the main branch", () => {
+    expect(repoFile("rust/LINUX.md")).toBe(
+      "https://github.com/Sidharth-Singh10/dex-voice/blob/main/rust/LINUX.md",
+    );
+    expect(repoFile("README.md")).toBe(`${repoUrl}/blob/main/README.md`);
   });
 });
