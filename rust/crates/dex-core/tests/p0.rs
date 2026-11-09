@@ -114,6 +114,24 @@ impl PhraseSink for DisconnectedSink {
     }
 }
 
+/// Models a worker that finishes synthesis at once: the first PCM is queued
+/// and the turn slot is released. Lets gate tests run with a successful
+/// (cancel-free) phrase and real pop timing instead of a held turn.
+struct FakePcmSink {
+    groups: Mutex<Vec<Vec<String>>>,
+    output: Arc<PcmQueue>,
+}
+
+impl PhraseSink for FakePcmSink {
+    fn try_send(&self, dispatch: Dispatch) -> SendOutcome {
+        self.groups.lock().unwrap().push(dispatch.words.clone());
+        dispatch.token.received();
+        self.output.push(&vec![0.05; 960]);
+        dispatch.token.mark_pcm();
+        SendOutcome::Sent
+    }
+}
+
 /// One phrase whose committed text appears after a single frame.
 fn spec(committed: &str, finalize: FinalizeOutcome) -> ScriptedSpec {
     ScriptedSpec {
@@ -730,4 +748,228 @@ fn input_is_muted_while_output_is_queued() {
     handle.join().unwrap();
     assert!(muted, "microphone must be muted");
     assert!(sink.groups.lock().unwrap().is_empty());
+}
+
+#[test]
+fn capture_stall_resumes_normally_without_cancel_after_successful_phrase() {
+    // Normal (cancel-free) resume, distinct from
+    // `gate_resumes_after_cancel_even_when_capture_stalls` where a no-PCM turn
+    // is cancelled at 2 s. Here synthesis succeeds (PCM queued), capture then
+    // stalls past the guard, and the gate returns only after
+    // last_pop + buffer + guard. No cancel may be requested.
+    let specs = vec![
+        spec(
+            "hello ",
+            FinalizeOutcome::Final(ScriptedText::new("hello ", "")),
+        ),
+        ScriptedSpec::default(),
+        spec(
+            "again ",
+            FinalizeOutcome::Final(ScriptedText::new("again ", "")),
+        ),
+    ];
+    let output = Arc::new(PcmQueue::new(4096));
+    let sink = Arc::new(FakePcmSink {
+        groups: Mutex::new(Vec::new()),
+        output: Arc::clone(&output),
+    });
+    let (tx, rx) = sync_channel::<Vec<f32>>(4096);
+    let mut recognizer = ScriptedRecognizer::new(specs);
+    let status = Arc::new(Mutex::new(Status::default()));
+    let inflight = InFlight::new();
+    let status_thread = Arc::clone(&status);
+    let output_thread = Arc::clone(&output);
+    let inflight_thread = Arc::clone(&inflight);
+    let sink_thread = Arc::clone(&sink);
+    let handle = thread::spawn(move || {
+        run_loop(
+            rx,
+            &mut recognizer,
+            sink_thread.as_ref(),
+            &status_thread,
+            &output_thread,
+            &RealClock,
+            &inflight_thread,
+            EndpointConfig::default(),
+            None,
+        )
+        .unwrap();
+    });
+
+    tx.send(vec![0.5; 320]).unwrap();
+    for _ in 0..60 {
+        tx.send(vec![0.0; 320]).unwrap();
+    }
+    let first = wait_until(Duration::from_secs(3), || {
+        !sink.groups.lock().unwrap().is_empty()
+    });
+    let muted = wait_until(Duration::from_secs(2), || {
+        status.lock().unwrap().input_paused
+    });
+    assert!(first, "first phrase must dispatch");
+    assert!(muted, "gate must close while PCM is queued");
+    assert_eq!(status.lock().unwrap().cancel_requests, 0);
+    assert!(!output.is_empty(), "fake synthesis must queue PCM");
+
+    // Capture stall: stop delivering blocks. Drain the queue like playback;
+    // the loop's timeout ticks must reopen the gate after the guard.
+    let mut drain = vec![0.0; 4096];
+    output.pop_into(&mut drain);
+    assert!(output.is_empty());
+    let resumed = wait_until(Duration::from_secs(4), || {
+        !status.lock().unwrap().input_paused
+    });
+
+    // Resume delivery; the next utterance must dispatch.
+    tx.send(vec![0.5; 320]).unwrap();
+    for _ in 0..60 {
+        let _ = tx.send(vec![0.0; 320]);
+    }
+    let second = wait_until(Duration::from_secs(3), || {
+        sink.groups.lock().unwrap().len() >= 2
+    });
+
+    drop(tx);
+    handle.join().unwrap();
+
+    assert!(resumed, "gate must reopen after pop + buffer + guard");
+    assert!(second, "utterance after resume must dispatch");
+    assert_eq!(
+        sink.groups.lock().unwrap().clone(),
+        vec![vec!["hello".to_owned()], vec!["again".to_owned()]]
+    );
+    let status = status.lock().unwrap();
+    assert_eq!(status.cancel_requests, 0, "normal resume must not cancel");
+    assert_eq!(status.cancel_timeouts, 0);
+    assert_ne!(status.state, dex_core::State::Failed);
+    assert!(status.transcript.contains("hello"));
+    assert!(status.transcript.contains("again"));
+}
+
+#[test]
+fn digital_loop_echo_is_discarded_and_gate_waits_for_guard() {
+    // Digital loop: our own queued PCM comes back as echo (loud blocks) while
+    // Speaking. It must never become a second phrase (no self-talk), the
+    // transcript stays at one phrase, and Listening returns only after
+    // last_pop + buffer + guard, not as soon as the queue empties.
+    let specs = vec![
+        spec(
+            "hello ",
+            FinalizeOutcome::Final(ScriptedText::new("hello ", "")),
+        ),
+        ScriptedSpec::default(),
+        spec(
+            "again ",
+            FinalizeOutcome::Final(ScriptedText::new("again ", "")),
+        ),
+    ];
+    let output = Arc::new(PcmQueue::new(4096));
+    let sink = Arc::new(FakePcmSink {
+        groups: Mutex::new(Vec::new()),
+        output: Arc::clone(&output),
+    });
+    let (tx, rx) = sync_channel::<Vec<f32>>(4096);
+    let mut recognizer = ScriptedRecognizer::new(specs);
+    let status = Arc::new(Mutex::new(Status::default()));
+    let inflight = InFlight::new();
+    let status_thread = Arc::clone(&status);
+    let output_thread = Arc::clone(&output);
+    let inflight_thread = Arc::clone(&inflight);
+    let sink_thread = Arc::clone(&sink);
+    let handle = thread::spawn(move || {
+        run_loop(
+            rx,
+            &mut recognizer,
+            sink_thread.as_ref(),
+            &status_thread,
+            &output_thread,
+            &RealClock,
+            &inflight_thread,
+            EndpointConfig::default(),
+            None,
+        )
+        .unwrap();
+    });
+
+    tx.send(vec![0.5; 320]).unwrap();
+    for _ in 0..60 {
+        tx.send(vec![0.0; 320]).unwrap();
+    }
+    let first = wait_until(Duration::from_secs(3), || {
+        !sink.groups.lock().unwrap().is_empty()
+    });
+    assert!(first, "first phrase must dispatch");
+    assert!(wait_until(Duration::from_secs(2), || {
+        status.lock().unwrap().input_paused
+    }));
+    assert_eq!(sink.groups.lock().unwrap().len(), 1);
+
+    // Echo burst: loud audio that would arm a phrase if listening.
+    for _ in 0..80 {
+        tx.send(vec![0.5; 320]).unwrap();
+    }
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        sink.groups.lock().unwrap().len(),
+        1,
+        "echo must not become a second phrase"
+    );
+    assert_eq!(
+        status.lock().unwrap().transcript.matches("hello").count(),
+        1,
+        "transcript must stay at one phrase (no self-talk)"
+    );
+    assert!(status.lock().unwrap().input_paused);
+
+    // Pop-resume with a forced zero-gap: first pop drains the synth PCM,
+    // second pop on the empty queue is a zero-padded underrun that must not
+    // move last_pop. Gate stays closed through the guard.
+    let mut drain = vec![0.0; 4096];
+    let popped = output.pop_into(&mut drain);
+    assert!(popped > 0, "synth PCM must drain");
+    let last_pop = output.last_pop().expect("real pop sets last_pop");
+    let pops_after = output.pops();
+    let mut gap = vec![7.0; 64];
+    assert_eq!(output.pop_into(&mut gap), 0);
+    assert!(gap.iter().all(|v| *v == 0.0), "gap must be zero-padded");
+    assert_eq!(output.last_pop(), Some(last_pop), "gap must not fake a pop");
+    assert_eq!(output.pops(), pops_after);
+    thread::sleep(Duration::from_millis(100));
+    assert!(
+        status.lock().unwrap().input_paused,
+        "queue empty is not enough; guard must hold"
+    );
+    // Speech inside the guard is still discarded.
+    for _ in 0..20 {
+        tx.send(vec![0.5; 320]).unwrap();
+    }
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(sink.groups.lock().unwrap().len(), 1);
+    assert!(status.lock().unwrap().input_paused);
+
+    let resumed = wait_until(Duration::from_secs(4), || {
+        !status.lock().unwrap().input_paused
+    });
+    assert!(resumed, "gate returns only after buffer + guard");
+    assert_eq!(sink.groups.lock().unwrap().len(), 1);
+    assert_eq!(
+        status.lock().unwrap().transcript.matches("hello").count(),
+        1
+    );
+
+    tx.send(vec![0.5; 320]).unwrap();
+    for _ in 0..60 {
+        let _ = tx.send(vec![0.0; 320]);
+    }
+    let second = wait_until(Duration::from_secs(3), || {
+        sink.groups.lock().unwrap().len() >= 2
+    });
+    drop(tx);
+    handle.join().unwrap();
+    assert!(second, "phrase after guard must dispatch");
+    let status = status.lock().unwrap();
+    assert_eq!(status.cancel_requests, 0);
+    assert_eq!(status.busy_drops, 0, "echo was gated, not overlapped");
+    assert_eq!(status.transcript.matches("again").count(), 1);
+    assert_ne!(status.state, dex_core::State::Failed);
 }

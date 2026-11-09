@@ -732,14 +732,7 @@ fn signal_bar(s: &State, k: &Kit) -> El {
         .label("Signal")
         .child(text("Signal").font(label_style()).color(k.c.text_muted))
         .child(
-            text("p50/p95: first committed word → first queued PCM (incl. synthesis)")
-                .font(faint_style())
-                .color(k.c.text_muted)
-                .wrap()
-                .w_full(),
-        )
-        .child(
-            text("Not playback or acoustic end-to-end latency.")
+            text("p50/p95: first committed word → first queued PCM (includes the phrase wait and synthesis; not playback or acoustic end-to-end latency).")
                 .font(faint_style())
                 .color(k.c.text_muted)
                 .wrap()
@@ -1487,8 +1480,10 @@ mod tests {
         state.status.p95_ms = Some(684.0);
         let rt = runtime(state, (900.0, 640.0));
         let text = body_text(&rt);
-        assert!(text.contains("first committed word → first queued PCM"));
-        assert!(text.contains("Not playback or acoustic end-to-end latency."));
+        // Exact approved wording (code now measures first queued PCM, not end
+        // of synthesis). Old "(incl. synthesis)" label must be gone.
+        assert!(text.contains("p50/p95: first committed word → first queued PCM (includes the phrase wait and synthesis; not playback or acoustic end-to-end latency)."));
+        assert!(!text.contains("(incl. synthesis)"));
         assert!(text.contains("95th percentile"));
         assert!(!text.contains("slowest 5%"));
     }
@@ -1500,10 +1495,33 @@ mod tests {
         state.status.input_drops = 7;
         state.status.capture_drops = 11;
         let rt = runtime(state, (900.0, 640.0));
-        let text = body_text(&rt);
-        assert!(text.contains("Mic drops"));
-        assert!(text.contains("input+capture"));
-        assert!(text.contains("18"));
+        let texts: Vec<String> = rt
+            .elements()
+            .iter()
+            .filter_map(|element| element.text.clone())
+            .collect();
+        // Specific cell value: an exact "18" text node (7 + 11), not merely a
+        // substring that could match "180" or nearby counters.
+        assert!(texts.iter().any(|t| t == "18"), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t != "18" && t.contains("18")),
+            "{texts:?}"
+        );
+        assert!(texts.iter().any(|t| t == "Mic drops"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "input+capture"), "{texts:?}");
+        // Sum, not a constant: a different total changes the cell.
+        let mut state = State::test_fixture();
+        state.status.state = EngineState::Running;
+        state.status.input_drops = 3;
+        state.status.capture_drops = 4;
+        let rt = runtime(state, (900.0, 640.0));
+        let texts: Vec<String> = rt
+            .elements()
+            .iter()
+            .filter_map(|element| element.text.clone())
+            .collect();
+        assert!(texts.iter().any(|t| t == "7"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t == "18"), "{texts:?}");
     }
 
     #[test]

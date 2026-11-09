@@ -1256,7 +1256,7 @@ fn tts_inner(
         let mut trimmer = config
             .trim_tts
             .then(|| Trimmer::new(source_rate, config.trim_threshold, 50));
-        let mut audio_samples = 0usize;
+        let mut first_pcm: Option<Instant> = None;
         let mut cancelled = false;
 
         let result = (|| -> Result<()> {
@@ -1283,8 +1283,10 @@ fn tts_inner(
                         break;
                     }
                     output.push(&out);
+                    if first_pcm.is_none() {
+                        first_pcm = Some(Instant::now());
+                    }
                     dispatch.token.mark_pcm();
-                    audio_samples += out.len();
                 }
                 if cancelled {
                     break;
@@ -1299,8 +1301,10 @@ fn tts_inner(
                     let out = resampler.process(&piece);
                     if !out.is_empty() {
                         output.push(&out);
+                        if first_pcm.is_none() {
+                            first_pcm = Some(Instant::now());
+                        }
                         dispatch.token.mark_pcm();
-                        audio_samples += out.len();
                     }
                 }
                 if !trimmer.started {
@@ -1321,31 +1325,38 @@ fn tts_inner(
             continue;
         }
         if let Err(error) = result {
-            bump(status, |s| s.synthesis_errors += 1);
-            append_marker(status, "[speech error]");
-            let failures = status
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .synthesis_errors;
-            if failures >= SYNTHESIS_FAILURE_LIMIT {
-                fail(
-                    status,
-                    FailureDomain::Synthesis,
-                    format!("Speech: {error:#}"),
-                );
+            if note_synthesis_error(status, format!("{error:#}")) {
                 return Ok(());
             }
-            set_synthesis(status, SynthesisState::Idle);
             continue;
         }
 
-        if audio_samples > 0 {
-            update_output_status(status, &output, config.output_rate, at);
+        if let Some(first_pcm) = first_pcm {
+            update_output_status(status, &output, config.output_rate, at, first_pcm);
         }
         set_synthesis(status, SynthesisState::Idle);
         // `dispatch` drops here; the token releases the single in-flight slot.
     }
     Ok(())
+}
+
+fn note_synthesis_error(status: &Arc<Mutex<Status>>, error: String) -> bool {
+    // Production synthesis-failure marker path (not a dispatch failure). Kept
+    // as a helper so the marker + counter + terminal transition are testable
+    // hermetically without loading a Phonon model.
+    bump(status, |s| s.synthesis_errors += 1);
+    append_marker(status, "[speech error]");
+    let failures = status
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .synthesis_errors;
+    if failures >= SYNTHESIS_FAILURE_LIMIT {
+        fail(status, FailureDomain::Synthesis, format!("Speech: {error}"));
+        true
+    } else {
+        set_synthesis(status, SynthesisState::Idle);
+        false
+    }
 }
 
 fn finish_cancelled(status: &Arc<Mutex<Status>>, output: &PcmQueue, dispatch: &Dispatch) {
@@ -1375,8 +1386,18 @@ fn set_synthesis(status: &Arc<Mutex<Status>>, state: SynthesisState) {
     }
 }
 
-fn update_output_status(status: &Arc<Mutex<Status>>, output: &PcmQueue, rate: u32, at: Instant) {
-    let delay = at.elapsed().as_secs_f64() * 1000.0;
+fn update_output_status(
+    status: &Arc<Mutex<Status>>,
+    output: &PcmQueue,
+    rate: u32,
+    at: Instant,
+    first_pcm: Instant,
+) {
+    // Approved metric: first committed word (`at`) -> first queued PCM.
+    // `first_pcm` is when the first sample was pushed into the output queue,
+    // not end-of-synthesis. `saturating_duration_since` keeps the helper total
+    // even if a test clock and the push clock disagree.
+    let delay = first_pcm.saturating_duration_since(at).as_secs_f64() * 1000.0;
     let mut status = status.lock().unwrap_or_else(|e| e.into_inner());
     status.group_delays.push(delay);
     if status.group_delays.len() > MAX_GROUP_DELAYS {
@@ -1639,15 +1660,252 @@ mod tests {
     }
 
     #[test]
-    fn metric_delay_is_computed_from_at() {
+    fn metric_delay_is_first_pcm_not_end_of_synthesis() {
+        // Deterministic: t0 = first committed word, t1 = first PCM push,
+        // t2 = later end-of-synthesis. Expected sample is t1 - t0; t2 excluded.
         let status = Arc::new(Mutex::new(Status::default()));
         let output = PcmQueue::new(16);
         output.push(&[0.1; 4]);
-        let at = Instant::now();
-        update_output_status(&status, &output, 16_000, at);
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(250);
+        let t2 = t0 + Duration::from_millis(5000);
+        update_output_status(&status, &output, 16_000, t0, t1);
+        {
+            let s = status.lock().unwrap();
+            assert_eq!(s.group_delays.len(), 1);
+            assert!(
+                (s.group_delays[0] - 250.0).abs() < 1e-6,
+                "{}",
+                s.group_delays[0]
+            );
+            assert!(s.group_delays[0] < t2.duration_since(t0).as_secs_f64() * 1000.0 / 2.0);
+        }
+        // End-of-synthesis arriving later must not change the sample: calling
+        // again with the same t0/t1 after a delay still yields 250 ms.
+        thread::sleep(Duration::from_millis(20));
+        update_output_status(&status, &output, 16_000, t0, t1);
         let s = status.lock().unwrap();
-        assert!(s.p50_ms.is_some());
-        assert!(s.p95_ms.is_some());
-        assert_eq!(s.group_delays.len(), 1);
+        assert_eq!(s.group_delays.len(), 2);
+        assert!(
+            (s.group_delays[1] - 250.0).abs() < 1e-6,
+            "{}",
+            s.group_delays[1]
+        );
+    }
+
+    #[test]
+    fn metric_p95_is_the_95th_percentile_of_first_pcm_delays() {
+        let status = Arc::new(Mutex::new(Status::default()));
+        let output = PcmQueue::new(16);
+        output.push(&[0.1; 4]);
+        let t0 = Instant::now();
+        // 101 samples: 0, 10, ..., 1000 ms. p50 index 50 -> 500 ms,
+        // p95 index 95 -> 950 ms.
+        for i in 0..101_u64 {
+            update_output_status(
+                &status,
+                &output,
+                16_000,
+                t0,
+                t0 + Duration::from_millis(i * 10),
+            );
+        }
+        let s = status.lock().unwrap();
+        assert_eq!(s.group_delays.len(), 101);
+        assert!((s.p50_ms.unwrap() - 500.0).abs() < 1e-6, "{:?}", s.p50_ms);
+        assert!((s.p95_ms.unwrap() - 950.0).abs() < 1e-6, "{:?}", s.p95_ms);
+    }
+
+    #[test]
+    fn overflow_and_drop_counters_account_for_every_sample() {
+        // Output overflow + underrun + conservation: pushed == queued +
+        // popped + dropped, so no sample is silently lost.
+        let queue = PcmQueue::new(100);
+        let mut popped_total = 0usize;
+        let mut pushed_total = 0usize;
+        pushed_total += 80;
+        assert_eq!(queue.push(&[1.0; 80]), 0);
+        assert_eq!(queue.dropped(), 0);
+        assert_eq!(queue.len(), 80);
+        pushed_total += 80;
+        assert_eq!(queue.push(&[1.0; 80]), 60);
+        assert_eq!(queue.dropped(), 60);
+        assert_eq!(queue.len(), 100);
+        let mut buf = vec![0.0; 40];
+        popped_total += queue.pop_into(&mut buf);
+        assert_eq!(popped_total, 40);
+        assert_eq!(queue.len(), 60);
+        pushed_total += 50;
+        assert_eq!(queue.push(&[1.0; 50]), 10);
+        assert_eq!(queue.dropped(), 70);
+        assert_eq!(queue.len(), 100);
+        assert_eq!(
+            pushed_total,
+            queue.len() + popped_total + queue.dropped() as usize,
+            "pushed must equal queued + popped + dropped"
+        );
+        // Underrun: empty pop is zero-padded and is not a pop.
+        let small = PcmQueue::new(8);
+        let now = Instant::now();
+        let mut empty = [9.0; 4];
+        assert_eq!(small.pop_into_at(&mut empty, now), 0);
+        assert_eq!(empty, [0.0; 4]);
+        assert_eq!(small.last_pop(), None);
+        assert_eq!(small.pops(), 0);
+        // Dropped seconds are the live queue's dropped samples over rate.
+        let status = Arc::new(Mutex::new(Status::default()));
+        update_output_status(&status, &queue, 100, now, now + Duration::from_millis(10));
+        let s = status.lock().unwrap();
+        assert!(
+            (s.dropped_seconds - 0.70).abs() < 1e-9,
+            "{}",
+            s.dropped_seconds
+        );
+        assert!(
+            (s.queued_seconds - 1.0).abs() < 1e-9,
+            "{}",
+            s.queued_seconds
+        );
+    }
+
+    #[test]
+    fn input_and_capture_drops_match_injected_failures() {
+        // Engine input channel full -> input_drops; capture callback -> capture_drops.
+        let (input_tx, _input_rx) = sync_channel::<Vec<f32>>(2);
+        let (sink_tx, _sink_rx) = sync_channel::<Option<Dispatch>>(1);
+        let engine = Engine {
+            status: Arc::new(Mutex::new(Status::default())),
+            input: Mutex::new(Some(input_tx)),
+            inflight: InFlight::new(),
+            sink: Arc::new(ChannelSink::new(sink_tx)),
+            output: Arc::new(PcmQueue::new(16)),
+            workers: Arc::new(Mutex::new(Vec::new())),
+            asr_thread: Mutex::new(None),
+            stop_thread: Mutex::new(None),
+            stop_requested: Arc::new(AtomicBool::new(false)),
+            stopping: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(engine.push_input(&[0.1; 4]));
+        assert!(engine.push_input(&[0.1; 4]));
+        assert!(!engine.push_input(&[0.1; 4]));
+        assert!(!engine.push_input(&[0.1; 4]));
+        assert!(!engine.push_input(&[0.1; 4]));
+        engine.note_capture_drop();
+        engine.note_capture_drop();
+        engine.note_capture_drop();
+        engine.note_capture_drop();
+        let s = engine.status();
+        assert_eq!(s.input_drops, 3);
+        assert_eq!(s.capture_drops, 4);
+        assert_eq!(s.input_drops + s.capture_drops, 7);
+    }
+
+    #[test]
+    fn long_output_alarm_tracks_queue_and_never_unmutes() {
+        // >= 30 s queued -> alarm. can_listen stays false while queued, so the
+        // gate cannot unmute even after the post-pop guard.
+        let status = Arc::new(Mutex::new(Status::default()));
+        let output = PcmQueue::new(1000);
+        output.push(&vec![0.1; 310]);
+        let now = Instant::now();
+        update_output_status(&status, &output, 10, now, now + Duration::from_millis(5));
+        {
+            let s = status.lock().unwrap();
+            assert!(
+                (s.queued_seconds - 31.0).abs() < 1e-9,
+                "{}",
+                s.queued_seconds
+            );
+            assert!(s.long_output_alarm);
+        }
+        let inflight = InFlight::new();
+        assert!(!can_listen(&inflight, &output, now));
+        assert!(!can_listen(
+            &inflight,
+            &output,
+            now + Duration::from_millis(OUTPUT_BUFFER_MS + OUTPUT_GUARD_MS + 5000)
+        ));
+        // Below threshold clears the alarm.
+        let status2 = Arc::new(Mutex::new(Status::default()));
+        let output2 = PcmQueue::new(1000);
+        output2.push(&vec![0.1; 290]);
+        update_output_status(&status2, &output2, 10, now, now + Duration::from_millis(5));
+        let s2 = status2.lock().unwrap();
+        assert!(
+            (s2.queued_seconds - 29.0).abs() < 1e-9,
+            "{}",
+            s2.queued_seconds
+        );
+        assert!(!s2.long_output_alarm);
+    }
+
+    #[test]
+    fn speech_error_marker_counts_and_fails_after_limit() {
+        // Production synthesis-failure path (tts_inner error branch), not a
+        // dispatch disconnect. No PCM pushed -> no metric sample; the failed
+        // phrase is counted in synthesis_errors and marked [speech error].
+        let status = Arc::new(Mutex::new(Status {
+            transcript: "hello ".into(),
+            words: 1,
+            ..Status::default()
+        }));
+        assert!(!note_synthesis_error(&status, "synthesis boom".into()));
+        {
+            let s = status.lock().unwrap();
+            assert_eq!(s.synthesis_errors, 1);
+            assert!(s.transcript.contains("[speech error]"), "{}", s.transcript);
+            assert!(s.group_delays.is_empty());
+            assert_eq!(s.p50_ms, None);
+            assert_eq!(s.p95_ms, None);
+            assert_eq!(s.dispatch_failures, 0);
+            assert_eq!(s.synthesis_stalls, 0);
+            assert_ne!(s.state, State::Failed);
+            assert_eq!(s.synthesis_state, SynthesisState::Idle);
+        }
+        assert!(!note_synthesis_error(&status, "synthesis boom".into()));
+        assert!(note_synthesis_error(&status, "synthesis boom".into()));
+        let s = status.lock().unwrap();
+        assert_eq!(s.synthesis_errors, 3);
+        assert_eq!(s.transcript.matches("[speech error]").count(), 3);
+        assert_eq!(s.state, State::Failed);
+        assert_eq!(s.failure_domain, FailureDomain::Synthesis);
+        assert_eq!(s.synthesis_state, SynthesisState::Failed);
+        assert!(s.error.as_deref().unwrap_or("").contains("synthesis boom"));
+        assert!(s.group_delays.is_empty());
+    }
+
+    #[test]
+    fn zero_gap_pop_does_not_fake_a_pop() {
+        // Digital loop gap: popping an empty queue (zero-padded underrun) must
+        // not set last_pop and must not start the guard. Only a pop that
+        // returns samples does; pop-resume then blocks until buffer+guard.
+        let inflight = InFlight::new();
+        let output = PcmQueue::new(16);
+        let now = Instant::now();
+        assert!(can_listen(&inflight, &output, now));
+        let mut block = [7.0; 4];
+        assert_eq!(output.pop_into_at(&mut block, now), 0);
+        assert_eq!(block, [0.0; 4]);
+        assert_eq!(output.last_pop(), None);
+        assert!(can_listen(&inflight, &output, now), "gap must not mute");
+        output.push(&[1.0; 4]);
+        assert!(!can_listen(&inflight, &output, now));
+        assert_eq!(output.pop_into_at(&mut block, now), 4);
+        assert_eq!(output.last_pop(), Some(now));
+        assert!(!can_listen(
+            &inflight,
+            &output,
+            now + Duration::from_millis(OUTPUT_BUFFER_MS + OUTPUT_GUARD_MS - 1)
+        ));
+        assert!(can_listen(
+            &inflight,
+            &output,
+            now + Duration::from_millis(OUTPUT_BUFFER_MS + OUTPUT_GUARD_MS)
+        ));
+        // A later gap pop must not move last_pop.
+        let later = now + Duration::from_millis(OUTPUT_BUFFER_MS + OUTPUT_GUARD_MS + 100);
+        assert_eq!(output.pop_into_at(&mut block, later), 0);
+        assert_eq!(output.last_pop(), Some(now));
+        assert!(can_listen(&inflight, &output, later));
     }
 }

@@ -77,10 +77,7 @@ takes priority over minimizing the output queue.
   uninterrupted talk), not word-by-word. Clause pauses below that are kept
   together, so a sentence's final word is not split off or dropped. Latency is
   therefore well above the <500 ms target.
-- The displayed p50/p95 are **first committed word → first queued PCM** (now
-  including synthesis time), not playback or acoustic end-to-end latency; the
-  phrase wait and synthesis backlog are included in practice through the queue.
-  p95 is the 95th percentile, not a “slowest 5%” threshold. Queue and dropped
+- p50/p95: first committed word → first queued PCM (includes the phrase wait and synthesis; not playback or acoustic end-to-end latency). p95 is the 95th percentile, not a “slowest 5%” threshold. Queue and dropped
   seconds are read from the live PCM queue between engine snapshots.
 - The 30-second output buffer can accumulate delay on long speech. No
   cancellation or simultaneous talk handling yet.

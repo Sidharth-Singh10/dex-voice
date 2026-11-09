@@ -166,7 +166,7 @@ fn restart_succeeds_and_subsequent_phrase_speaks() {
     drop(tx);
     handle.join().unwrap();
 
-    assert!(sink.groups.lock().unwrap().len() >= 1);
+    assert!(!sink.groups.lock().unwrap().is_empty());
     assert!(status.lock().unwrap().tts_restarts >= 1);
     assert_ne!(status.lock().unwrap().state, dex_core::State::Failed);
 }
