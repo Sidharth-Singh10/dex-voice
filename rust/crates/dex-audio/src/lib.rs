@@ -614,3 +614,34 @@ mod tests {
         assert_eq!(queue.clear(), 0);
     }
 }
+
+pub fn output_device_ready(id: &str, label: &str) -> bool {
+    let host = cpal::default_host();
+    let devices: Vec<_> = match host.output_devices() {
+        Ok(d) => d.collect(),
+        Err(_) => return false,
+    };
+    let device = if !id.trim().is_empty() {
+        devices
+            .iter()
+            .find(|d| d.id().is_ok_and(|x| x.to_string() == id))
+            .cloned()
+    } else {
+        None
+    };
+    let device = device.or_else(|| {
+        if !label.trim().is_empty() {
+            let wanted = label.trim().to_lowercase();
+            devices.iter().find(|d| {
+                let name = d.to_string();
+                name.eq_ignore_ascii_case(label) || name.to_lowercase().contains(&wanted)
+            }).cloned()
+        } else {
+            None
+        }
+    });
+    match device {
+        Some(d) => d.default_output_config().is_ok(),
+        None => false,
+    }
+}

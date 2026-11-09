@@ -1,6 +1,7 @@
 //! Dex Voice: Rune control panel over the Rust ASR→TTS pipeline.
 
 mod config;
+mod device_recovery;
 mod self_test;
 mod ui;
 
@@ -621,12 +622,18 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
 
     // While recovering, probe presence and reopen exactly once.
     if s.device_recovering {
-        let present = dex_audio::output_device_present(
+        let now = Instant::now();
+        let _present = dex_audio::output_device_present(
             &s.settings.output_device,
             &s.settings.output_device_label,
         );
         let deadline = s.device_recovery_deadline.unwrap_or_else(Instant::now);
-        if present {
+        let ready = if now >= deadline {
+            dex_audio::output_device_ready(&s.settings.output_device, &s.settings.output_device_label)
+        } else {
+            false
+        };
+        if now >= deadline && ready {
             let mut reopened = false;
             if let Some(queue) = s.queue.clone() {
                 match start_playback(&s.settings.output_device, Arc::clone(&queue)) {
@@ -679,7 +686,7 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
                 s.closing = true;
             }
             changed = true;
-        } else if Instant::now() >= deadline {
+        } else if now >= deadline {
             s.device_recovering = false;
             s.device_recovery_deadline = None;
             s.supervisor.fail_device();
