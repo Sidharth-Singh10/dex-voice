@@ -720,7 +720,7 @@ fn signal_cell(k: &Kit, label: &str, hint: &str, value: &str) -> El {
 fn signal_bar(s: &State, k: &Kit) -> El {
     let queue = format!("{:.1} s", s.status.queued_seconds);
     let dropped = format!("{:.1} s", s.status.dropped_seconds);
-    let input_drops = s.status.input_drops.to_string();
+    let mic_drops = (s.status.input_drops + s.status.capture_drops).to_string();
     col()
         .w_full()
         .padding(12.0)
@@ -732,7 +732,7 @@ fn signal_bar(s: &State, k: &Kit) -> El {
         .label("Signal")
         .child(text("Signal").font(label_style()).color(k.c.text_muted))
         .child(
-            text("p50/p95: first committed word → first queued PCM")
+            text("p50/p95: first committed word → first queued PCM (incl. synthesis)")
                 .font(faint_style())
                 .color(k.c.text_muted)
                 .wrap()
@@ -764,7 +764,7 @@ fn signal_bar(s: &State, k: &Kit) -> El {
                 ))
                 .child(signal_cell(k, "Queue", "waiting", &queue))
                 .child(signal_cell(k, "Dropped", "output", &dropped))
-                .child(signal_cell(k, "Mic drops", "capture", &input_drops)),
+                .child(signal_cell(k, "Mic drops", "input+capture", &mic_drops)),
         )
 }
 
@@ -1491,6 +1491,17 @@ mod tests {
         assert!(text.contains("Not playback or acoustic end-to-end latency."));
         assert!(text.contains("95th percentile"));
         assert!(!text.contains("slowest 5%"));
+    }
+
+    #[test]
+    fn mic_drops_include_capture_loss() {
+        let mut state = State::test_fixture();
+        state.status.state = EngineState::Running;
+        state.status.input_drops = 2;
+        state.status.capture_drops = 3;
+        let rt = runtime(state, (900.0, 640.0));
+        let text = body_text(&rt);
+        assert!(text.contains("5"));
     }
 
     #[test]

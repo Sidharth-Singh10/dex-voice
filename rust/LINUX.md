@@ -69,19 +69,19 @@ takes priority over minimizing the output queue.
 ## Known limitations
 
 - **Half-duplex.** The app stops listening while its own speech is queued,
-  then waits for ~150 ms of quiet before listening again. It will not talk over
-  you, but speech that overlaps its own voice is discarded. Use headphones if
-  another app plays DexMicrophone on your speakers; there is no echo
-  cancellation.
+  then waits for the 500 ms post-pop guard before listening again. It will not
+  talk over you, but speech that overlaps its own voice is discarded. Use
+  headphones if another app plays DexMicrophone on your speakers; there is no
+  echo cancellation.
 - Speech is spoken at a pause boundary (~800 ms of silence, plus a 10 s cap for
   uninterrupted talk), not word-by-word. Clause pauses below that are kept
   together, so a sentence's final word is not split off or dropped. Latency is
   therefore well above the <500 ms target.
-- The displayed p50/p95 are **first committed word → first queued PCM**, not
-  playback or acoustic end-to-end latency; the phrase wait and synthesis backlog
-  are included in practice through the queue. p95 is the 95th percentile, not a
-  “slowest 5%” threshold. Queue and dropped seconds are read from the live PCM
-  queue between engine snapshots.
+- The displayed p50/p95 are **first committed word → first queued PCM** (now
+  including synthesis time), not playback or acoustic end-to-end latency; the
+  phrase wait and synthesis backlog are included in practice through the queue.
+  p95 is the 95th percentile, not a “slowest 5%” threshold. Queue and dropped
+  seconds are read from the live PCM queue between engine snapshots.
 - The 30-second output buffer can accumulate delay on long speech. No
   cancellation or simultaneous talk handling yet.
 - Settings uses explicit pickers for microphone, virtual output, and voice; there
@@ -91,5 +91,10 @@ takes priority over minimizing the output queue.
 - The console enumerates devices once at launch only to name the routing panel;
   it does not open capture or playback until Start. If enumeration fails, the
   routing panel says so and Settings offers Refresh.
-- No first-run UI download or Linux desktop package is provided yet; the
-  installer script provisions the pinned local models and English voice set.
+- **Bounded shutdown.** Stop runs a control thread with bounded joins (about 8 s
+  total); the UI never joins workers. If a worker fails to exit, the engine is
+  released with a `shutdown_incomplete` warning and `orphan_loader_exits` is
+  reported. A failed engine stays attached until Stop releases it.
+- **Failed-attached.** While failed, the engine stays attached and Start is
+  refused until Stop releases it; the failure domain (synthesis vs. device) and
+  the terminal state are preserved.
