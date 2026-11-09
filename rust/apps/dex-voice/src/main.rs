@@ -543,40 +543,60 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
     let previous = s.status.clone();
     let mut changed = changed || status != s.status;
 
-    // Device-loss detection: playback error callback, missing output device, or a
-    // short queue stall. Any of these triggers recovery below.
+    // Device-loss detection. cpal's PulseAudio enumeration can omit a present
+    // virtual sink (or report its id as an error), so a negative presence probe
+    // alone is not evidence of loss. Only a playback error or queued audio that
+    // the stream is not consuming counts.
     let mut device_lost = false;
+    let mut loss_reason = "none";
     if let Some(playback) = &s.playback
         && playback.health.has_error()
     {
         device_lost = true;
+        loss_reason = "playback error";
         status.device_errors += 1;
         if let Some(msg) = playback.health.take_error() {
             s.error = Some(format!("Audio output error: {msg}"));
         }
     }
-    if !device_lost
-        && s.playback.is_some()
-        && !dex_audio::output_device_present(
+    if let Some(queue) = s.queue.clone() {
+        let pops = queue.pops();
+        if queue.is_empty() {
+            // Nothing queued: restart the stall window. Otherwise a timestamp
+            // from before the phrase makes freshly queued audio look stalled on
+            // the first poll, before playback has had a chance to pop it.
+            s.last_pops = pops;
+            s.last_pop_change = Instant::now();
+        } else if pops != s.last_pops {
+            s.last_pops = pops;
+            s.last_pop_change = Instant::now();
+        } else if !device_lost
+            && status.state == EngineState::Running
+            && s.playback.is_some()
+            && s.capture.is_some()
+            && s.last_pop_change.elapsed() > Duration::from_secs(2)
+        {
+            device_lost = true;
+            loss_reason = "queue stalled";
+            status.device_errors += 1;
+            s.error = Some("Audio output stopped consuming queued audio.".into());
+        }
+    }
+
+    if device_lost {
+        let present = dex_audio::output_device_present(
             &s.settings.output_device,
             &s.settings.output_device_label,
-        )
-    {
-        device_lost = true;
-        status.device_errors += 1;
-        s.error = Some("Audio output device is no longer available.".into());
-    }
-    if !device_lost
-        && status.state == EngineState::Running
-        && s.capture.is_some()
-        && let Some(queue) = s.queue.clone()
-        && !queue.is_empty()
-        && s.last_pop_change.elapsed() > Duration::from_millis(500)
-        && queue.pops() == s.last_pops
-    {
-        device_lost = true;
-        status.device_errors += 1;
-        s.error = Some("Audio output stopped consuming queued audio.".into());
+        );
+        let (queued, pops) = s
+            .queue
+            .as_ref()
+            .map(|queue| (queue.len(), queue.pops()))
+            .unwrap_or((0, 0));
+        eprintln!(
+            "device: loss detected reason={loss_reason} present={present} queued={queued} pops={pops} since_pop_ms={}",
+            s.last_pop_change.elapsed().as_millis()
+        );
     }
 
     // Policy-driven debounced recovery (single source of truth).
@@ -594,9 +614,14 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
                 status.device_errors += 1;
                 status.device_state = DeviceState::Recovering;
                 status.state = EngineState::Recovering;
+                eprintln!(
+                    "device: recovering window_ms={}",
+                    s.device_recovery.window.as_millis()
+                );
                 changed = true;
             }
             RecoveryAction::Fail => {
+                eprintln!("device: recovery failed reason=second-loss");
                 status.device_state = DeviceState::Lost;
                 status.failure_domain = FailureDomain::Device;
                 status.device_recovery_failures += 1;
@@ -628,13 +653,15 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
         match action {
             RecoveryAction::Reopen => {
                 let mut reopened = false;
+                let mut reopen_error: Option<String> = None;
                 if let Some(queue) = s.queue.clone() {
                     match start_playback(&s.settings.output_device, Arc::clone(&queue)) {
                         Ok(playback) => {
                             s.playback = Some(playback);
                             reopened = true;
                         }
-                        Err(_) => {
+                        Err(error) => {
+                            reopen_error = Some(format!("{error:#}"));
                             if !s.settings.output_device_label.trim().is_empty()
                                 && let Ok(choices) = device_choices(false)
                                 && let Some(choice) = choices.iter().find(|c| {
@@ -642,17 +669,22 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
                                         .eq_ignore_ascii_case(&s.settings.output_device_label)
                                         || c.id == s.settings.output_device
                                 })
-                                && let Ok(playback) = start_playback(&choice.id, Arc::clone(&queue))
                             {
-                                s.playback = Some(playback);
-                                s.settings.output_device = choice.id.clone();
-                                s.settings.output_device_label = choice.label.clone();
-                                reopened = true;
+                                match start_playback(&choice.id, Arc::clone(&queue)) {
+                                    Ok(playback) => {
+                                        s.playback = Some(playback);
+                                        s.settings.output_device = choice.id.clone();
+                                        s.settings.output_device_label = choice.label.clone();
+                                        reopened = true;
+                                    }
+                                    Err(error) => reopen_error = Some(format!("{error:#}")),
+                                }
                             }
                         }
                     }
                 }
                 if reopened {
+                    eprintln!("device: reopened output {:?}", s.settings.output_device);
                     s.device_recovery.reopen_result(true);
                     status.device_recoveries += 1;
                     s.last_pop_change = Instant::now();
@@ -660,6 +692,10 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
                     status.state = EngineState::Running;
                     s.error = None;
                 } else {
+                    eprintln!(
+                        "device: reopen failed error={}",
+                        reopen_error.as_deref().unwrap_or("output device not ready")
+                    );
                     s.device_recovery.reopen_result(false);
                     status.device_state = DeviceState::Lost;
                     status.failure_domain = FailureDomain::Device;
@@ -677,6 +713,7 @@ fn poll(s: &mut State, _clock: f64, tx: &mut Tx) -> bool {
                 changed = true;
             }
             RecoveryAction::Fail => {
+                eprintln!("device: recovery failed reason=deadline");
                 status.device_state = DeviceState::Lost;
                 status.failure_domain = FailureDomain::Device;
                 status.device_recovery_failures += 1;

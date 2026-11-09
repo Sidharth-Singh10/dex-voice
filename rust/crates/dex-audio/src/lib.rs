@@ -7,9 +7,9 @@ pub use trimmer::Trimmer;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use cpal::FromSample;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
@@ -183,29 +183,57 @@ pub fn device_choices(input: bool) -> Result<Vec<DeviceChoice>> {
         .collect())
 }
 
+/// Whether one enumerated device satisfies a saved id/label pair.
+///
+/// cpal's PulseAudio host can report `id()` as an error for virtual sinks
+/// created by `module-null-sink`, and can omit such devices from enumeration
+/// while they are active. Match by label as well as id so a usable device is
+/// not treated as absent.
+fn device_matches(id: &str, label: &str, device_id: Option<&str>, name: &str) -> bool {
+    let id = id.trim();
+    let label = label.trim();
+    if id.is_empty() && label.is_empty() {
+        return false;
+    }
+    if !id.is_empty() {
+        if device_id.is_some_and(|device_id| device_id == id) {
+            return true;
+        }
+        // The stored id is `host:name`; accept a matching name suffix when the
+        // host prefix differs or the device id is unavailable.
+        if let (Some(device_id), Some((_, wanted))) = (device_id, id.rsplit_once(':'))
+            && let Some((_, actual)) = device_id.rsplit_once(':')
+            && actual.eq_ignore_ascii_case(wanted)
+        {
+            return true;
+        }
+    }
+    if !label.is_empty() {
+        let wanted = label.to_lowercase();
+        return name.eq_ignore_ascii_case(label) || name.to_lowercase().contains(&wanted);
+    }
+    false
+}
+
 pub fn output_device_present(id: &str, label: &str) -> bool {
     let host = cpal::default_host();
     let devices: Vec<_> = match host.output_devices() {
         Ok(d) => d.collect(),
         Err(_) => return true,
     };
-    if !id.trim().is_empty()
-        && devices
-            .iter()
-            .any(|d| d.id().is_ok_and(|x| x.to_string() == id))
-    {
+    if id.trim().is_empty() && label.trim().is_empty() {
         return true;
     }
-    if !label.trim().is_empty() {
-        let wanted = label.trim().to_lowercase();
-        if devices.iter().any(|d| {
-            let name = d.to_string();
-            name.eq_ignore_ascii_case(label) || name.to_lowercase().contains(&wanted)
-        }) {
+    let mut unverifiable = false;
+    for device in &devices {
+        let device_id = device.id().ok().map(|id| id.to_string());
+        unverifiable |= device_id.is_none();
+        if device_matches(id, label, device_id.as_deref(), &device.to_string()) {
             return true;
         }
     }
-    id.trim().is_empty() && label.trim().is_empty()
+    // An enumeration that cannot be resolved is not proof of absence.
+    unverifiable
 }
 
 /// The default output device's sample rate, so the engine can produce audio at
@@ -230,27 +258,38 @@ fn find_device(host: &cpal::Host, name: &str, input: bool) -> Result<cpal::Devic
                 .context("no default output device")
         };
     }
-    let devices = if input {
-        host.input_devices().context("enumerate input devices")?
-    } else {
-        host.output_devices().context("enumerate output devices")?
-    };
-    let devices: Vec<_> = devices.collect();
-    devices
-        .iter()
-        .find(|device| device.id().is_ok_and(|id| id.to_string() == name))
-        .or_else(|| {
-            devices
-                .iter()
-                .find(|device| device.to_string().eq_ignore_ascii_case(name))
-        })
-        .or_else(|| {
-            devices
-                .iter()
-                .find(|device| device.to_string().to_lowercase().contains(&wanted))
-        })
-        .cloned()
-        .with_context(|| format!("no device matching {name:?}"))
+    // Device enumeration races PipeWire graph changes (and briefly drops
+    // sources when a stream opens or closes). Retry before reporting a
+    // missing device so a transient gap does not fail the whole bridge.
+    for attempt in 0..3 {
+        let devices = if input {
+            host.input_devices().context("enumerate input devices")?
+        } else {
+            host.output_devices().context("enumerate output devices")?
+        };
+        let devices: Vec<_> = devices.collect();
+        if let Some(device) = devices.iter().find(|device| {
+            let device_id = device.id().ok().map(|id| id.to_string());
+            device_matches(name, "", device_id.as_deref(), &device.to_string())
+        }) {
+            return Ok(device.clone());
+        }
+        if let Some(device) = devices
+            .iter()
+            .find(|device| device.to_string().eq_ignore_ascii_case(name))
+            .or_else(|| {
+                devices
+                    .iter()
+                    .find(|device| device.to_string().to_lowercase().contains(&wanted))
+            })
+        {
+            return Ok(device.clone());
+        }
+        if attempt < 2 {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    bail!("no device matching {name:?}")
 }
 
 fn mono_f32<T>(data: &[T], channels: usize) -> Vec<f32>
@@ -619,32 +658,62 @@ pub fn output_device_ready(id: &str, label: &str) -> bool {
     let host = cpal::default_host();
     let devices: Vec<_> = match host.output_devices() {
         Ok(d) => d.collect(),
-        Err(_) => return false,
+        Err(_) => return true,
     };
-    let device = if !id.trim().is_empty() {
-        devices
-            .iter()
-            .find(|d| d.id().is_ok_and(|x| x.to_string() == id))
-            .cloned()
-    } else {
-        None
-    };
-    let device = device.or_else(|| {
-        if !label.trim().is_empty() {
-            let wanted = label.trim().to_lowercase();
-            devices
-                .iter()
-                .find(|d| {
-                    let name = d.to_string();
-                    name.eq_ignore_ascii_case(label) || name.to_lowercase().contains(&wanted)
-                })
-                .cloned()
-        } else {
-            None
+    if id.trim().is_empty() && label.trim().is_empty() {
+        return host
+            .default_output_device()
+            .is_some_and(|device| device.default_output_config().is_ok());
+    }
+    let mut unverifiable = false;
+    for device in &devices {
+        let device_id = device.id().ok().map(|id| id.to_string());
+        unverifiable |= device_id.is_none();
+        if device_matches(id, label, device_id.as_deref(), &device.to_string()) {
+            return device.default_output_config().is_ok();
         }
-    });
-    match device {
-        Some(d) => d.default_output_config().is_ok(),
-        None => false,
+    }
+    // An enumeration that cannot be resolved is not proof of absence. The
+    // reopen attempt reports the concrete error if the device is really gone.
+    unverifiable
+}
+
+#[cfg(test)]
+mod device_match_tests {
+    use super::device_matches;
+
+    #[test]
+    fn matches_an_exact_saved_id() {
+        assert!(device_matches(
+            "pulseaudio:dex_voice",
+            "",
+            Some("pulseaudio:dex_voice"),
+            "DexVoice"
+        ));
+    }
+
+    #[test]
+    fn resolves_an_id_error_sink_by_label() {
+        assert!(device_matches("pulseaudio:p0_out", "P0Out", None, "P0Out"));
+    }
+
+    #[test]
+    fn matches_a_renamed_host_prefix() {
+        assert!(device_matches(
+            "pipewire:dex_voice",
+            "",
+            Some("pulseaudio:dex_voice"),
+            "DexVoice"
+        ));
+    }
+
+    #[test]
+    fn rejects_an_unrelated_device() {
+        assert!(!device_matches(
+            "pulseaudio:dex_voice",
+            "",
+            Some("pulseaudio:speakers"),
+            "Speakers"
+        ));
     }
 }
